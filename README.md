@@ -1,4 +1,4 @@
-# CEC-Sonos Bridge 🔊📺
+# CEC-Sonos Bridge
 
 Control your Sonos speakers with your TV remote using a Raspberry Pi and HDMI-CEC.
 
@@ -29,12 +29,12 @@ The Pi plugs into an HDMI port on your TV and pretends to be an "audio system." 
 
 ## Features
 
-- 📱 **Phone-friendly setup wizard** — No coding required
-- 📡 **Auto hotspot mode** — Creates WiFi network if it can't connect
-- 🖥️ **Admin panel** — Access at `sonosbridge.local`
-- 📺 **TV splash screen** — Shows QR code to admin panel
-- 🔄 **Auto-recovery** — Falls back to setup mode if WiFi is lost
-- ⬆️ **OTA updates** — Update from the admin panel
+- **Phone-friendly setup wizard** — No coding required
+- **Auto hotspot mode** — Creates WiFi network if it can't connect
+- **Admin panel** — Access at `sonosbridge.local`
+- **TV splash screen** — Shows QR code to admin panel
+- **Auto-recovery** — Falls back to setup mode if WiFi is lost
+- **OTA updates** — Update from the admin panel
 
 ---
 
