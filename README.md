@@ -78,7 +78,7 @@ The Pi plugs into an HDMI port on your TV and pretends to be an "audio system." 
 5. Download and run the installer:
    ```bash
    cd ~
-   git clone https://github.com/YOUR_USERNAME/cec-sonos-bridge.git
+   git clone https://github.com/rhetoricdesigns/cec-sonos-bridge.git
    cd cec-sonos-bridge
    sudo bash install.sh
    ```
