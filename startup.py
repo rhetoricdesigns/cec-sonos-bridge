@@ -76,7 +76,7 @@ def check_skip_ap_mode():
 def is_wifi_configured():
     """Check if any WiFi connection is configured (excluding hotspot)."""
     success, output = run_cmd(
-        "nmcli -t -f NAME,TYPE connection show | grep ':802-11-wireless$' | grep -v 'SonosBridge'"
+        "nmcli -t -f NAME,TYPE connection show | grep ':802-11-wireless$' | grep -v 'SonosBridge-Hotspot'"
     )
     configured = bool(output.strip())
     log.info(f"WiFi configured: {configured}")
