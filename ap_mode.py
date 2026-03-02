@@ -176,7 +176,6 @@ SETUP_PAGE_HTML = """<!DOCTYPE html>
                     <div class="status info">Enter WiFi password above and click "Scan for Sonos Speakers"</div>
                 </div>
             </div>
-            <button type="button" class="btn-test hidden" id="testBtn">Test Volume</button>
             <input type="hidden" id="selectedSpeakerIp" value="">
             <input type="hidden" id="selectedSpeakerName" value="">
         </div>
@@ -255,7 +254,6 @@ function selectSpeaker(index) {
     selectedSpeaker = speakerData[index];
     document.getElementById("selectedSpeakerIp").value = selectedSpeaker.ip;
     document.getElementById("selectedSpeakerName").value = selectedSpeaker.name;
-    document.getElementById("testBtn").classList.remove("hidden");
     document.getElementById("step2-num").classList.add("done");
     document.getElementById("step2-num").textContent = "OK";
 }
@@ -546,7 +544,6 @@ document.getElementById("togglePassword").addEventListener("click", function() {
 });
 
 document.getElementById("scanSonosBtn").addEventListener("click", testWifiAndLoadSpeakers);
-document.getElementById("testBtn").addEventListener("click", testVolume);
 document.getElementById("saveBtn").addEventListener("click", saveConfig);
 
 // Load networks and any cached speakers on page load
