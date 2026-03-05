@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 """
-CEC-Sonos Bridge v1.3.0
+CEC-Sonos Bridge v1.5.0
 Monitors HDMI-CEC for TV remote volume commands and controls Sonos speaker.
 Also runs a web server for admin access at http://sonosbridge.local
 
 Uses cec-client which talks to the Pi's VideoCore GPU for hardware CEC support.
 
-Key improvements over v1.2.0:
-  - Responds to Samsung Anynet+ handshake messages so TV keeps forwarding
-    volume commands from ALL remotes (Samsung, Apple TV, Fire Stick, etc.)
-  - Smart keepalive: reasserts System Audio Mode only when idle
-  - ARC always declined: Feature Aborts all ARC requests to prevent
-    Samsung from dropping the connection
-  - Reports audio status back to TV after volume changes
-  - Syncs volume from Sonos on startup and periodically
+Key improvements over v1.4.0:
+  - Auto TV brand detection via CEC Vendor ID (opcode 0x87)
+  - Samsung (Anynet+): ARC declined — Samsung drops connection if accepted
+  - LG (SimpLink):     ARC accepted — LG won't recognise audio system otherwise
+  - LG reconnect handling: when LG periodically terminates ARC (normal behaviour),
+    we acknowledge, re-assert System Audio Mode, and re-accept the next initiation
+  - Handles LG's non-standard 0x8B Vendor Remote Button Up (key release)
+  - Works with any TV brand; falls back to "accept ARC" for unknowns
+
+TV brand detection:
+  CEC opcode 0x87 (Device Vendor ID) is broadcast by the TV on startup.
+  Samsung vendor ID: 00:00:F0
+  LG vendor ID:      00:E0:91
+  Sony vendor ID:    00:08:00  (treated as accept-ARC)
 
 CEC Opcodes handled:
   Incoming:
@@ -22,17 +28,24 @@ CEC Opcodes handled:
     70    = System Audio Mode Request
     71    = Give Audio Status
     7D    = Give System Audio Mode Status
-    C3    = Request ARC Initiation (always declined)
-    C4    = Request ARC Termination (always declined)
-    A4    = Request Short Audio Descriptor (always declined)
+    87    = Device Vendor ID  (used to detect TV brand)
+    8B    = LG Vendor Remote Button Up (key release, ignored)
+    C0    = Request ARC Initiation (accepted for LG; declined for Samsung)
+    C3    = Request ARC Initiation alt (accepted for LG; declined for Samsung)
+    C4    = Request ARC Termination (acknowledged; re-assert SAM for LG)
+    A4    = Request Short Audio Descriptor (declined)
 
   Outgoing:
     72:01 = Set System Audio Mode ON
     7A:xx = Report Audio Status
     7E:01 = System Audio Mode Status ON
-    00    = Feature Abort
+    C1    = Report ARC Initiated (LG only)
+    C2    = Report ARC Terminated (LG only)
+    00    = Feature Abort (Samsung ARC decline)
 
-Hardware: Raspberry Pi Zero 2 W connected to TV via HDMI (non-ARC port)
+Hardware: Raspberry Pi Zero 2 W
+  Samsung: use any non-ARC HDMI port
+  LG:      use the ARC-labelled HDMI port (usually HDMI 2)
 """
 
 import subprocess
@@ -83,6 +96,20 @@ cec_lock = Lock()
 # Smart keepalive tracking
 last_volume_command_time = 0
 last_volume_lock = Lock()
+
+# TV brand detection (set from CEC Vendor ID opcode 0x87)
+# Controls ARC accept/decline behaviour
+tv_brand = 'unknown'   # 'samsung', 'lg', or 'unknown'
+tv_brand_lock = Lock()
+
+# Known CEC vendor IDs (3-byte, uppercase hex joined by colons)
+TV_VENDORS = {
+    '00:00:F0': 'samsung',
+    '00:E0:91': 'lg',
+    '00:08:00': 'sony',
+    '00:90:F5': 'philips',
+    '00:00:39': 'toshiba',
+}
 
 
 def load_config():
@@ -200,12 +227,48 @@ def is_addressed_to_audio_system(line):
     return False
 
 
-def handle_cec_handshake(line):
-    """Respond to CEC handshake messages from Samsung TV.
+def detect_tv_brand(line):
+    """Parse CEC opcode 0x87 (Device Vendor ID) from the TV (LA 0).
 
-    Critical for keeping Anynet+ happy so it continues forwarding
-    volume commands to us. ARC is ALWAYS declined to prevent the
-    TV from dropping our connection.
+    Called from the main loop on every CEC line.  When the TV broadcasts
+    its vendor ID we store the brand so ARC handling can adapt.
+
+    Format on the bus:  >> 0F:87:VV:VV:VV
+      Source 0 (TV), destination F (broadcast), opcode 87, 3 vendor bytes.
+    """
+    global tv_brand
+    # Only care about messages FROM address 0 (TV) with opcode 87
+    match = re.search(r'>>\s*0[Ff]:87:([0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2})', line)
+    if not match:
+        return
+    vendor_id = match.group(1).upper()
+    with tv_brand_lock:
+        detected = TV_VENDORS.get(vendor_id, 'unknown')
+        if tv_brand != detected:
+            tv_brand = detected
+            log.info(f"TV brand detected: {tv_brand} (vendor ID {vendor_id})")
+
+
+def arc_accept_mode():
+    """Return True if this TV brand requires ARC to be accepted."""
+    with tv_brand_lock:
+        brand = tv_brand
+    # Samsung (Anynet+) must have ARC declined.
+    # Everything else (LG, Sony, unknown) gets ARC accepted.
+    return brand != 'samsung'
+
+
+def handle_cec_handshake(line):
+    """Respond to CEC handshake messages — brand-aware ARC handling.
+
+    Samsung (Anynet+): ARC must be DECLINED or Samsung drops us.
+    LG (SimpLink):     ARC must be ACCEPTED or LG never recognises the Pi
+                       as an audio system, and Apple TV never offers 'HDMI'
+                       volume mode.
+
+    LG periodically terminates and re-initiates ARC (every few minutes) —
+    this is normal.  We acknowledge the termination, then re-assert System
+    Audio Mode so we stay recognised between renegotiations.
 
     Returns True if we handled the message.
     """
@@ -216,12 +279,13 @@ def handle_cec_handshake(line):
     if not match:
         return False
 
-    data = match.group(1).strip()
+    data = match.group(1).strip().upper()
 
-    # 0x70 - System Audio Mode Request -> respond ON
+    # 0x70 - System Audio Mode Request -> respond ON + report volume
     if data.startswith('70'):
         log.info("CEC RX: System Audio Mode Request -> ON")
         send_cec_command("tx 5F:72:01")
+        report_audio_status()
         return True
 
     # 0x71 - Give Audio Status -> report volume
@@ -236,20 +300,42 @@ def handle_cec_handshake(line):
         send_cec_command("tx 50:7E:01")
         return True
 
-    # 0xC3 - Request ARC Initiation -> ALWAYS DECLINE
-    # Samsung will drop the connection if we accept ARC on non-ARC port
-    if data == 'C3':
-        log.info("CEC RX: Request ARC Initiation -> DECLINED (Feature Abort)")
-        send_cec_command("tx 50:00:C3:00")
+    # 0x8B - LG Vendor Remote Button Up (non-standard key release)
+    # LG sends this instead of the standard 0x45 User Control Released.
+    if data.startswith('8B'):
+        log.debug("CEC RX: LG Vendor Remote Button Up (0x8B) - ignored")
         return True
 
-    # 0xC4 - Request ARC Termination -> ALWAYS DECLINE
+    # 0xC0 / 0xC3 - Request ARC Initiation
+    if data in ('C0', 'C3'):
+        if arc_accept_mode():
+            log.info(f"CEC RX: ARC Initiation (0x{data}) -> ACCEPTED (LG/unknown mode)")
+            send_cec_command("tx 50:C1")    # Report ARC Initiated
+        else:
+            log.info(f"CEC RX: ARC Initiation (0x{data}) -> DECLINED (Samsung mode)")
+            send_cec_command(f"tx 50:00:{data}:00")  # Feature Abort
+        return True
+
+    # 0xC4 - Request ARC Termination
     if data == 'C4':
-        log.info("CEC RX: Request ARC Termination -> DECLINED (Feature Abort)")
-        send_cec_command("tx 50:00:C4:00")
+        if arc_accept_mode():
+            # LG periodically terminates ARC then re-initiates — this is normal.
+            # Acknowledge, then immediately re-assert System Audio Mode so we
+            # stay visible as an audio system during the brief gap.
+            log.info("CEC RX: ARC Termination -> acknowledged (LG renegotiation)")
+            send_cec_command("tx 50:C2")    # Report ARC Terminated
+            # Re-assert SAM after a short pause so LG re-discovers us
+            def _reassert():
+                time.sleep(1)
+                send_cec_command("tx 5F:72:01")
+                report_audio_status()
+            Thread(target=_reassert, daemon=True).start()
+        else:
+            log.info("CEC RX: ARC Termination -> declined (Samsung mode, no-op)")
+            send_cec_command("tx 50:00:C4:00")  # Feature Abort
         return True
 
-    # 0xA4 - Request Short Audio Descriptor -> DECLINE
+    # 0xA4 - Request Short Audio Descriptor -> decline (not supported)
     if data.startswith('A4'):
         log.info("CEC RX: Request Short Audio Descriptor -> Feature Abort")
         send_cec_command("tx 50:00:A4:00")
@@ -318,7 +404,7 @@ def run_bridge(config):
     hdmi_port = config.get('hdmi_port', '2')
 
     log.info("=" * 50)
-    log.info("CEC-Sonos Bridge v1.3.0 Active")
+    log.info("CEC-Sonos Bridge v1.5.0 Active")
     log.info(f"Speaker: {speaker_name} ({speaker_ip})")
     log.info(f"HDMI Port: {hdmi_port}")
     log.info(f"Admin: http://sonosbridge.local")
@@ -326,7 +412,7 @@ def run_bridge(config):
     log.info("")
     log.info("Volume commands: :44:41 (up) :44:42 (down) :44:43 (mute)")
     log.info("Smart keepalive: reassert after %ds idle", SAM_IDLE_THRESHOLD)
-    log.info("ARC: always declined")
+    log.info("ARC: auto (LG=accept, Samsung=decline, detected from vendor ID)")
     log.info("")
 
     sync_volume_from_sonos(speaker_ip)
@@ -382,6 +468,9 @@ def run_bridge(config):
             if ">>" not in line:
                 continue
 
+            # Detect TV brand from vendor ID broadcast (opcode 0x87)
+            detect_tv_brand(line)
+
             # Handle handshake messages first
             if handle_cec_handshake(line):
                 continue
@@ -417,7 +506,7 @@ def run_bridge(config):
 
 def main():
     """Main entry point."""
-    log.info("CEC-Sonos Bridge v1.3.0 starting...")
+    log.info("CEC-Sonos Bridge v1.5.0 starting...")
 
     config = load_config()
     if not config:
