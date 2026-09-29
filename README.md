@@ -169,7 +169,7 @@ Works with any TV that supports HDMI-CEC:
 
 1. **startup.py** — Runs at boot, decides whether to enter AP mode or bridge mode
 2. **ap_mode.py** — Creates WiFi hotspot and serves the setup wizard
-3. **cec_bridge.py** — Uses `cec-client` to monitor HDMI-CEC traffic, calls Sonos API via `soco` library
+3. **cec_bridge.py** — Joins HDMI-CEC as an audio system through the kernel's CEC device (`/dev/cec0`), calls Sonos API via `soco` library. It never claims the TV input, so other devices (Fire TV, Apple TV) keep control of what's on screen. Falls back to `cec-client` if `/dev/cec0` is missing.
 4. **web_server.py** — Serves the admin panel at port 80
 5. **splash_screen.py** — Generates and displays TV splash screen with QR code
 
@@ -196,3 +196,5 @@ MIT License — feel free to use, modify, and share!
 ## Contributing
 
 Found a bug? Have an idea? Open an issue or submit a pull request!
+
+Run the tests (no Pi needed) with `python3 -m unittest discover tests`.
