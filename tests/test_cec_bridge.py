@@ -8,6 +8,7 @@ kernel ioctls are patched, so these run on any machine with Python 3.
 
 import errno
 import logging
+import logging.handlers  # before FileHandler is patched below: its classes subclass it
 import os
 import queue
 import signal

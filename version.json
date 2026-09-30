@@ -1,5 +1,5 @@
 {
-  "version": "1.5.1",
-  "updated": "2026-09-29",
-  "changelog": "Fixed the TV switching to the Sonos Bridge splash screen when pressing Home on a Fire TV remote. The bridge now talks to the kernel CEC device directly and never takes over the TV input."
+  "version": "1.5.2",
+  "updated": "2026-09-30",
+  "changelog": "Adds a CEC Activity page (Settings > CEC Activity, or sonosbridge.local/cec) that shows every message between the TV, the Fire TV and the bridge, to track down the TV switching to the bridge when Home is pressed."
 }

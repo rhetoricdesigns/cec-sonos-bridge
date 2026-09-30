@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-CEC-Sonos Bridge v1.5.1
+CEC-Sonos Bridge v1.5.2
 Monitors HDMI-CEC for TV remote volume commands and controls Sonos speaker.
 Also runs a web server for admin access at http://sonosbridge.local
 
 Talks to the kernel's CEC device (/dev/cec0) directly, as a pure Audio System.
 Falls back to cec-client when /dev/cec0 is missing (legacy firmware CEC).
+
+Key improvements over v1.5.1:
+  - CEC activity log: every message the bridge sends and receives (including
+    the kernel's own replies) and every HDMI connection change, in plain
+    English, on the admin panel's CEC Activity page (sonosbridge.local/cec).
+    Flags any message that moves the TV to the bridge's input.
 
 Key improvements over v1.5.0:
   - Never takes over the TV input.  cec-client (libCEC) acts like a video
@@ -79,9 +85,11 @@ import time
 import re
 import signal
 import logging
+import logging.handlers
 import errno
 import fcntl
 import queue
+import select
 import struct
 from threading import Thread, Lock
 
@@ -132,6 +140,7 @@ cec_lock = Lock()
 CEC_DEVICE = '/dev/cec0'
 CEC_MSG = struct.Struct('=QQIIII16s7Bx')                # struct cec_msg
 CEC_LOG_ADDRS = struct.Struct('=4sHBBII15s4s4s4s48sx')  # struct cec_log_addrs
+CEC_EVENT = struct.Struct('=QII64s')                    # struct cec_event
 
 
 def _cec_ioctl(direction, nr, size):
@@ -143,10 +152,16 @@ CEC_ADAP_G_PHYS_ADDR = _cec_ioctl(2, 1, 2)
 CEC_ADAP_S_LOG_ADDRS = _cec_ioctl(3, 4, CEC_LOG_ADDRS.size)
 CEC_TRANSMIT = _cec_ioctl(3, 5, CEC_MSG.size)
 CEC_RECEIVE = _cec_ioctl(3, 6, CEC_MSG.size)
+CEC_DQEVENT = _cec_ioctl(3, 7, CEC_EVENT.size)
 CEC_S_MODE = _cec_ioctl(1, 9, 4)
 
 CEC_MODE_INITIATOR = 0x01
 CEC_MODE_EXCL_FOLLOWER = 0x20
+CEC_MODE_MONITOR = 0xE0      # listen only: what this adapter sends and receives
+CEC_MODE_MONITOR_ALL = 0xF0  # listen only: the whole bus, if the hardware can
+CEC_EVENT_STATE_CHANGE = 1
+CEC_EVENT_LOST_MSGS = 2
+CEC_EVENT_FL_DROPPED_EVENTS = 0x02
 CEC_TX_STATUS_OK = 0x01
 CEC_PHYS_ADDR_INVALID = 0xFFFF
 CEC_OP_CEC_VERSION_1_4 = 5
@@ -191,6 +206,57 @@ TV_VENDORS = {
     '00:90:F5': 'philips',
     '00:00:39': 'toshiba',
 }
+
+# CEC activity log: every message to and from the bridge in plain English, for the
+# admin panel's CEC Activity page (sonosbridge.local/cec)
+TRAFFIC_LOG_FILE = '/var/log/cec-sonos-bridge-cec.log'
+traffic_log = logging.getLogger('cec_traffic')
+traffic_log.propagate = False             # its own file, not the main log
+traffic_monitor_active = False            # the monitor logs the traffic; without it, the bridge does
+bridge_phys_addr = CEC_PHYS_ADDR_INVALID  # the bridge's TV input, e.g. 0x2000 = HDMI 2
+
+DEVICE_NAMES = ('TV', 'Recorder 1', 'Recorder 2', 'Tuner 1', 'Player 1', 'Bridge',
+                'Tuner 2', 'Tuner 3', 'Player 2', 'Recorder 3', 'Tuner 4', 'Player 3',
+                'Backup 1', 'Backup 2', 'Specific', 'Unregistered')
+
+OPCODE_NAMES = {
+    0x00: 'Feature Abort', 0x04: 'Image View On', 0x0D: 'Text View On',
+    0x32: 'Set Menu Language', 0x36: 'Standby', 0x44: 'Key Pressed', 0x45: 'Key Released',
+    0x46: 'Give OSD Name', 0x47: 'Set OSD Name', 0x70: 'System Audio Mode Request',
+    0x71: 'Give Audio Status', 0x72: 'Set System Audio Mode', 0x7A: 'Report Audio Status',
+    0x7D: 'Give System Audio Mode Status', 0x7E: 'System Audio Mode Status',
+    0x80: 'Routing Change', 0x81: 'Routing Information', 0x82: 'Active Source',
+    0x83: 'Give Physical Address', 0x84: 'Report Physical Address',
+    0x85: 'Request Active Source', 0x86: 'Set Stream Path', 0x87: 'Device Vendor ID',
+    0x89: 'Vendor Command', 0x8A: 'Vendor Button Down', 0x8B: 'Vendor Button Up',
+    0x8C: 'Give Device Vendor ID', 0x8D: 'Menu Request', 0x8E: 'Menu Status',
+    0x8F: 'Give Device Power Status', 0x90: 'Report Power Status', 0x91: 'Get Menu Language',
+    0x9D: 'Inactive Source', 0x9E: 'CEC Version', 0x9F: 'Get CEC Version',
+    0xA0: 'Vendor Command With ID', 0xA3: 'Report Short Audio Descriptor',
+    0xA4: 'Request Short Audio Descriptor', 0xA5: 'Give Features', 0xA6: 'Report Features',
+    0xA7: 'Request Current Latency', 0xA8: 'Report Current Latency', 0xC0: 'Initiate ARC',
+    0xC1: 'Report ARC Initiated', 0xC2: 'Report ARC Terminated',
+    0xC3: 'Request ARC Initiation', 0xC4: 'Request ARC Termination', 0xC5: 'Terminate ARC',
+    0xF8: 'CDC Message', 0xFF: 'Abort',
+}
+
+KEY_NAMES = {
+    0x00: 'Select', 0x01: 'Up', 0x02: 'Down', 0x03: 'Left', 0x04: 'Right',
+    0x09: 'Root Menu', 0x0A: 'Setup Menu', 0x0B: 'Contents Menu', 0x0D: 'Exit',
+    0x40: 'Power', 0x41: 'Volume Up', 0x42: 'Volume Down', 0x43: 'Mute', 0x44: 'Play',
+    0x45: 'Stop', 0x46: 'Pause', 0x65: 'Mute Function', 0x66: 'Restore Volume',
+    0x6B: 'Power Toggle', 0x6C: 'Power Off', 0x6D: 'Power On',
+}
+
+DEVICE_TYPES = ('TV', 'Recorder', 'Reserved', 'Tuner', 'Player', 'Audio System', 'Switch',
+                'Processor')
+POWER_STATES = ('on', 'standby', 'turning on', 'turning off')
+ABORT_REASONS = ('unrecognized', 'not in correct mode', 'cannot provide source',
+                 'invalid operand', 'refused', 'unable to determine')
+CEC_VERSIONS = {4: '1.3a', 5: '1.4', 6: '2.0'}
+
+# Messages that choose what the TV shows: (opcode, offset of the physical address)
+INPUT_OPCODES = {0x80: 2, 0x81: 0, 0x82: 0, 0x86: 0}
 
 
 def load_config():
@@ -285,8 +351,11 @@ def send_cec_command(command):
     global cec_proc
     with cec_lock:
         if cec_dev:
-            acked = cec_dev.transmit(parse_tx_command(command))
+            frame = parse_tx_command(command)
+            acked = cec_dev.transmit(frame)
             log.info(f"CEC TX: {command}" + ("" if acked else " (not acknowledged)"))
+            if not traffic_monitor_active:
+                log_cec_traffic(frame, sent=True, acked=acked)
         elif cec_proc and cec_proc.stdin:
             try:
                 cec_proc.stdin.write(command + "\n")
@@ -524,6 +593,8 @@ def answer_core_message(frame):
 
 def handle_cec_frame(frame, speaker_ip):
     """Handle one frame received from the kernel CEC device."""
+    if not traffic_monitor_active:
+        log_cec_traffic(frame, sent=False)
     if frame[0] >> 4 == 0:
         ask_tv_vendor_id()  # the TV is awake, so it can tell us its brand
     if not process_cec_line(format_cec_frame(frame), speaker_ip):
@@ -557,6 +628,148 @@ def announce_to_tv(osd_name):
 def format_physical_address(pa):
     """0x2000 -> '2.0.0.0' (TV input 2)"""
     return '.'.join(f'{(pa >> shift) & 0xF:x}' for shift in (12, 8, 4, 0))
+
+
+def describe_operands(opcode, ops):
+    """A message's operands in plain English, e.g. Active Source's physical address."""
+    def pa(i=0):
+        return format_physical_address((ops[i] << 8) | ops[i + 1])
+
+    def text():
+        return ops.decode('ascii', 'replace')
+
+    if opcode in (0x81, 0x82, 0x86, 0x9D):
+        return pa()
+    if opcode == 0x80:
+        return f"{pa(0)} to {pa(2)}"
+    if opcode == 0x84:
+        kind = DEVICE_TYPES[ops[2]] if ops[2] < len(DEVICE_TYPES) else f"type {ops[2]}"
+        return f"{pa()} ({kind})"
+    if opcode == 0x70:
+        return f"for {pa()}"
+    if opcode == 0x44:
+        return KEY_NAMES.get(ops[0], f"key 0x{ops[0]:02X}")
+    if opcode in (0x72, 0x7E):
+        return 'On' if ops[0] else 'Off'
+    if opcode == 0x7A:
+        return f"volume {ops[0] & 0x7F}" + (", muted" if ops[0] & 0x80 else "")
+    if opcode == 0x90:
+        return POWER_STATES[ops[0]] if ops[0] < len(POWER_STATES) else f"state {ops[0]}"
+    if opcode == 0x8D:
+        return ('activate', 'deactivate', 'query')[ops[0]]
+    if opcode == 0x8E:
+        return ('activated', 'deactivated')[ops[0]]
+    if opcode == 0x9E:
+        return CEC_VERSIONS.get(ops[0], f"version {ops[0]}")
+    if opcode in (0x32, 0x47):
+        return repr(text())
+    if opcode in (0x87, 0xA0):
+        vendor = ':'.join(f'{b:02X}' for b in ops[:3])
+        name = 'Pulse-Eight, the bridge' if vendor == '00:15:82' else TV_VENDORS.get(vendor)
+        rest = ':'.join(f'{b:02X}' for b in ops[3:])
+        return ' '.join(part for part in (vendor, f"({name})" if name else '', rest) if part)
+    if opcode == 0x00:
+        name = OPCODE_NAMES.get(ops[0], f"opcode 0x{ops[0]:02X}")
+        reason = ABORT_REASONS[ops[1]] if ops[1] < len(ABORT_REASONS) else f"reason {ops[1]}"
+        return f"of {name}: {reason}"
+    return ':'.join(f'{b:02X}' for b in ops)
+
+
+def describe_cec_frame(frame):
+    """b'\\x4f\\x82\\x10\\x00' -> 'Player 1 -> all: Active Source 1.0.0.0'"""
+    initiator, destination = frame[0] >> 4, frame[0] & 0x0F
+    who = f"{DEVICE_NAMES[initiator]} -> {'all' if destination == 0x0F else DEVICE_NAMES[destination]}"
+    if len(frame) < 2:
+        return f"{who}: ping"
+    opcode, ops = frame[1], bytes(frame[2:])
+    text = f"{who}: {OPCODE_NAMES.get(opcode, f'opcode 0x{opcode:02X}')}"
+    if opcode == 0x70 and not ops:
+        text += " (off)"
+    if ops:
+        try:
+            text += ' ' + describe_operands(opcode, ops)
+        except IndexError:  # too few operands for this opcode
+            text += ' ' + ':'.join(f'{b:02X}' for b in ops)
+    return text
+
+
+def input_switch_note(frame, sent):
+    """Why this message could move the TV to the bridge's input, or None."""
+    if len(frame) < 2:
+        return None
+    opcode = frame[1]
+    if sent and opcode in (0x04, 0x0D, 0x82):
+        return "THE BRIDGE ASKED THE TV TO SHOW IT - this should never happen"
+    offset = INPUT_OPCODES.get(opcode)
+    if offset is None or len(frame) < offset + 4 or bridge_phys_addr == CEC_PHYS_ADDR_INVALID:
+        return None
+    if (frame[offset + 2] << 8) | frame[offset + 3] == bridge_phys_addr:
+        return "TV IS SWITCHING TO THE SONOS BRIDGE INPUT"
+    return None
+
+
+def log_cec_traffic(frame, sent, acked=True):
+    """One line in the CEC activity log. Never raises: logging must not disturb the bridge."""
+    try:
+        _log_cec_traffic(frame, sent, acked)
+    except Exception as e:
+        log.warning(f"CEC activity log: could not record {bytes(frame).hex(':')}: {e}")
+
+
+def _log_cec_traffic(frame, sent, acked):
+    """Direction, raw bytes, and what they mean."""
+    global bridge_phys_addr
+    if len(frame) < 2:
+        return  # pings: TVs check who is there every few seconds
+    if sent and frame[1] == 0x84 and len(frame) >= 4:
+        bridge_phys_addr = (frame[2] << 8) | frame[3]  # the bridge announcing its input
+    destination = frame[0] & 0x0F
+    direction = 'OUT' if sent else 'IN ' if destination in (5, 0x0F) else '   '
+    raw = ':'.join(f'{b:02X}' for b in frame)
+    description = describe_cec_frame(frame)
+    line = f"{direction} {raw:<17} {description}"
+    if sent and not acked:
+        line += "  (not delivered)"
+    note = input_switch_note(frame, sent)
+    if note:
+        line += f"   !! {note}"
+        log.warning(f"CEC: {note}: {description}")
+    traffic_log.info(line)
+
+
+def log_cec_client_traffic(line):
+    """cec-client prints received messages as '>> 05:44:41' and sent ones as '<< 50:7a:1e'."""
+    match = re.search(r'(<<|>>)\s*([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2})*)', line)
+    if match:
+        log_cec_traffic(bytes.fromhex(match.group(2).replace(':', '')), sent=match.group(1) == '<<')
+
+
+def describe_hdmi_state(phys_addr, log_addr_mask, changed_more_than_once=False):
+    """A line for the activity log when the HDMI connection or the bridge's CEC address changes."""
+    if phys_addr == CEC_PHYS_ADDR_INVALID:
+        text = "HDMI connection down (TV off or cable unplugged)"
+    else:
+        claimed = "has" if log_addr_mask & (1 << 5) else "does not have"
+        text = (f"HDMI connection up: bridge is on TV input {format_physical_address(phys_addr)}, "
+                f"{claimed} the Audio System address")
+    if changed_more_than_once:
+        text += " (changed more than once)"
+    return f"--- {text} ---"
+
+
+def open_traffic_log():
+    """Send the CEC activity log to its own small file (at most about 1 MB with its backup)."""
+    if traffic_log.handlers:
+        return
+    try:
+        handler = logging.handlers.RotatingFileHandler(TRAFFIC_LOG_FILE, maxBytes=512 * 1024,
+                                                       backupCount=1)
+    except Exception as e:
+        log.warning(f"CEC activity log unavailable: {e}")
+        return
+    handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d  %(message)s', '%m-%d %H:%M:%S'))
+    traffic_log.addHandler(handler)
+    traffic_log.setLevel(logging.INFO)
 
 
 def pack_cec_msg(frame=b'', timeout_ms=0):
@@ -656,9 +869,144 @@ def open_kernel_cec(osd_name):
     device would bring back the input switching.
     """
     if not os.path.exists(CEC_DEVICE):
-        log.warning(f"{CEC_DEVICE} not found (legacy firmware CEC?) - using cec-client")
+        log.warning(f"{CEC_DEVICE} not found (legacy firmware CEC?) - using cec-client, "
+                    "which can switch the TV to the bridge when a device sends it a power key")
         return None
+    start_cec_monitor()  # first, so the activity log shows the bridge announcing itself
     return KernelCEC(osd_name)
+
+
+class CECMonitor:
+    """A second, listen-only handle on the CEC device, for the activity log.
+
+    It sees every message the bridge sends and receives, including the replies
+    the kernel makes on its own, and every change of HDMI connection (TV off or
+    on, cable pulled).  With hardware that allows it, it sees the whole bus.
+    """
+
+    MAX_PER_READ = 100
+
+    def __init__(self, device=CEC_DEVICE):
+        self.fd = os.open(device, os.O_RDWR | os.O_NONBLOCK)
+        try:
+            try:
+                fcntl.ioctl(self.fd, CEC_S_MODE, struct.pack('=I', CEC_MODE_MONITOR_ALL))
+                self.whole_bus = True
+            except OSError:
+                fcntl.ioctl(self.fd, CEC_S_MODE, struct.pack('=I', CEC_MODE_MONITOR))
+                self.whole_bus = False
+        except OSError:
+            os.close(self.fd)
+            raise
+        self.poller = select.poll()
+        self.poller.register(self.fd, select.POLLIN | select.POLLPRI)
+
+    def read(self, timeout_ms):
+        """What happened since the last call, waiting up to timeout_ms for something:
+        ('message', frame, sent, acked), ('state', phys_addr, log_addr_mask, changed_more_than_once)
+        and ('lost', count) tuples, oldest first."""
+        ready = self.poller.poll(timeout_ms)
+        if not ready:
+            return []
+        revents = ready[0][1]
+        if revents & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
+            raise OSError(errno.ENODEV, "CEC device went away")
+        stamped = []
+        if revents & select.POLLPRI:
+            stamped += self._dequeue(CEC_DQEVENT, CEC_EVENT.size, self._decode_event)
+        if revents & select.POLLIN:
+            stamped += self._dequeue(CEC_RECEIVE, CEC_MSG.size, self._decode_message)
+        # messages and events come from separate queues: put them back in the order they happened
+        return [item for _, item in sorted(stamped, key=lambda pair: pair[0])]
+
+    def _dequeue(self, request, size, decode):
+        """(kernel timestamp, item) for everything queued, until the queue is empty."""
+        stamped = []
+        for _ in range(self.MAX_PER_READ):
+            buf = bytearray(size)
+            try:
+                fcntl.ioctl(self.fd, request, buf)
+            except OSError as e:
+                if e.errno == errno.EAGAIN:  # queue empty
+                    break
+                raise
+            pair = decode(buf)
+            if pair:
+                stamped.append(pair)
+        return stamped
+
+    @staticmethod
+    def _decode_message(buf):
+        fields = CEC_MSG.unpack(buf)
+        tx_ts, rx_ts, length, tx_status = fields[0], fields[1], fields[2], fields[9]
+        frame = fields[6][:length]
+        sent = bool(tx_status)
+        return (tx_ts if sent else rx_ts,
+                ('message', frame, sent, bool(tx_status & CEC_TX_STATUS_OK)))
+
+    @staticmethod
+    def _decode_event(buf):
+        ts, event, flags, data = CEC_EVENT.unpack(buf)
+        if event == CEC_EVENT_STATE_CHANGE:
+            phys_addr, log_addr_mask = struct.unpack_from('=HH', data)
+            return ts, ('state', phys_addr, log_addr_mask, bool(flags & CEC_EVENT_FL_DROPPED_EVENTS))
+        if event == CEC_EVENT_LOST_MSGS:
+            return ts, ('lost', struct.unpack_from('=I', data)[0])
+        return None
+
+    def close(self):
+        os.close(self.fd)
+
+
+def log_monitor_item(item):
+    """Write one thing the monitor saw to the CEC activity log."""
+    global bridge_phys_addr
+    if item[0] == 'message':
+        log_cec_traffic(*item[1:])
+    elif item[0] == 'state':
+        bridge_phys_addr = item[1]
+        traffic_log.info(describe_hdmi_state(*item[1:]))
+    elif item[0] == 'lost':
+        traffic_log.info(f"--- {item[1]} messages came too fast to log ---")
+
+
+def run_cec_monitor(monitor):
+    """Thread: everything the monitor sees goes to the CEC activity log."""
+    global traffic_monitor_active
+    try:
+        while True:
+            for item in monitor.read(timeout_ms=5000):
+                log_monitor_item(item)
+    except Exception as e:
+        log.warning(f"CEC activity monitor stopped: {e}")
+    finally:
+        traffic_monitor_active = False
+        monitor.close()
+
+
+def start_cec_monitor():
+    """Start the activity log's monitor unless it is running (run_bridge restarts after errors)."""
+    global traffic_monitor_active
+    thread = background_threads.get('cec_monitor')
+    if thread is not None and thread.is_alive():
+        return
+    try:
+        monitor = CECMonitor()
+    except Exception as e:
+        log.warning(f"CEC activity monitor unavailable ({e}) - logging the bridge's own messages only")
+        return
+    traffic_monitor_active = True
+    try:
+        thread = Thread(target=run_cec_monitor, args=(monitor,), daemon=True)
+        thread.start()
+    except Exception as e:
+        traffic_monitor_active = False
+        monitor.close()
+        log.warning(f"CEC activity monitor could not start ({e}) - logging the bridge's own messages only")
+        return
+    background_threads['cec_monitor'] = thread
+    scope = "the whole HDMI bus" if monitor.whole_bus else "messages to and from the bridge"
+    log.info(f"CEC activity log ({scope}): {TRAFFIC_LOG_FILE}")
 
 
 def run_next_sonos_action():
@@ -758,14 +1106,17 @@ def display_splash_screen():
 
 def run_bridge(config):
     """Main CEC monitoring loop."""
-    global cec_proc, cec_dev
+    global cec_proc, cec_dev, bridge_phys_addr
 
     speaker_ip = config['speaker_ip']
     speaker_name = config.get('speaker_name', 'Sonos')
     hdmi_port = config.get('hdmi_port', '2')
 
+    open_traffic_log()
+    traffic_log.info("--- Sonos Bridge v1.5.2 starting ---")
+
     log.info("=" * 50)
-    log.info("CEC-Sonos Bridge v1.5.1 Active")
+    log.info("CEC-Sonos Bridge v1.5.2 Active")
     log.info(f"Speaker: {speaker_name} ({speaker_ip})")
     log.info(f"HDMI Port: {hdmi_port}")
     log.info(f"Admin: http://sonosbridge.local")
@@ -807,7 +1158,8 @@ def run_bridge(config):
         start_once(wifi_watchdog)
 
         if cec_dev:
-            pa = format_physical_address(cec_dev.physical_address())
+            bridge_phys_addr = cec_dev.physical_address()
+            pa = format_physical_address(bridge_phys_addr)
             log.info(f"CEC: {CEC_DEVICE} as Audio System at HDMI address {pa}")
             announce_to_tv(osd_name)
             while True:
@@ -819,6 +1171,8 @@ def run_bridge(config):
                 line = line.strip()
                 if not line:
                     continue
+
+                log_cec_client_traffic(line)
 
                 # Only process incoming CEC traffic
                 if ">>" not in line:
@@ -849,7 +1203,7 @@ def install_signal_handlers():
 
 def main():
     """Main entry point."""
-    log.info("CEC-Sonos Bridge v1.5.1 starting...")
+    log.info("CEC-Sonos Bridge v1.5.2 starting...")
 
     config = load_config()
     if not config:

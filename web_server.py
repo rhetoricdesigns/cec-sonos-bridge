@@ -16,6 +16,7 @@ Hardware: Raspberry Pi Zero 2 W
 
 import os
 import sys
+import html
 import json
 import time
 import signal
@@ -42,6 +43,7 @@ log = logging.getLogger(__name__)
 
 # Configuration
 APP_DIR = '/opt/cec-sonos-bridge'
+CEC_ACTIVITY_LOG = '/var/log/cec-sonos-bridge-cec.log'  # written by cec_bridge.py
 CONFIG_FILE = f'{APP_DIR}/config.json'
 VERSION_FILE = f'{APP_DIR}/version.json'
 BACKUP_DIR = f'{APP_DIR}/backups'
@@ -267,6 +269,101 @@ def restart_service():
 
 
 # ============================================================
+# CEC ACTIVITY
+# ============================================================
+
+def read_cec_activity(limit=200):
+    """The newest lines of the CEC activity log (and its rotated backup), newest first."""
+    lines = []
+    for path in (CEC_ACTIVITY_LOG + '.1', CEC_ACTIVITY_LOG):
+        try:
+            with open(path, encoding='utf-8', errors='replace') as f:
+                lines.extend(f.read().splitlines())
+        except OSError:
+            pass
+    return lines[::-1][:limit]
+
+
+def render_cec_activity(lines, version):
+    """The CEC Activity page: what the TV, the other HDMI devices and the bridge said to each other."""
+    rows = []
+    for line in lines:
+        row = html.escape(line)
+        if '!!' in line:
+            row = f'<span class="flag">{row}</span>'
+        elif line.rstrip().endswith(' ---'):  # HDMI connection changes, bridge restarts
+            row = f'<span class="state">{row}</span>'
+        rows.append(row)
+    body = '\n'.join(rows) or 'Nothing yet. The bridge records messages here while it is running.'
+    return CEC_ACTIVITY_HTML.replace('{version}', html.escape(version)).replace(
+        '{now}', datetime.now().strftime('%H:%M:%S')).replace('{rows}', body)
+
+
+CEC_ACTIVITY_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CEC Activity</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0; padding: 16px; color: #fff; min-height: 100vh;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+        }
+        h1 { font-size: 22px; margin: 0 0 8px; }
+        p { font-size: 14px; color: rgba(255,255,255,0.7); margin: 0 0 12px; line-height: 1.4; }
+        .buttons { display: flex; gap: 8px; margin-bottom: 12px; }
+        button {
+            flex: 1; padding: 12px; border: none; border-radius: 10px; font-size: 15px;
+            font-weight: 600; background: rgba(255,255,255,0.2); color: #fff; cursor: pointer;
+        }
+        pre {
+            margin: 0; padding: 10px; border-radius: 8px; background: rgba(0,0,0,0.35);
+            color: #9fe8c9; font-family: Menlo, Consolas, monospace; font-size: 11px;
+            line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+        }
+        .flag { color: #ffc107; font-weight: bold; }
+        .state { color: #8ab4f8; }
+    </style>
+</head>
+<body>
+    <h1>CEC Activity</h1>
+    <p>Every message between your TV, your other HDMI devices and the Sonos Bridge, newest first.
+       IN = to the bridge, OUT = from the bridge. Version v{version}, page loaded at {now}.</p>
+    <div class="buttons">
+        <button type="button" id="refreshBtn">Refresh</button>
+        <button type="button" id="copyBtn">Copy</button>
+        <button type="button" id="backBtn">Back</button>
+    </div>
+    <pre id="log">{rows}</pre>
+<script>
+document.getElementById("refreshBtn").addEventListener("click", function() {
+    window.location.reload();
+});
+document.getElementById("backBtn").addEventListener("click", function() {
+    window.location.href = "/";
+});
+document.getElementById("copyBtn").addEventListener("click", function() {
+    // Select the log, then copy it. If the browser won't copy, the text stays
+    // selected so the phone's own Copy option still works.
+    var range = document.createRange();
+    range.selectNodeContents(document.getElementById("log"));
+    var selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    var copied = false;
+    try { copied = document.execCommand("copy"); } catch (e) {}
+    this.textContent = copied ? "Copied!" : "Selected - copy it";
+});
+</script>
+</body>
+</html>
+"""
+
+
+# ============================================================
 # HTML TEMPLATES
 # ============================================================
 
@@ -451,6 +548,7 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
             <div id="settings" class="tab-content">
                 <button type="button" class="btn-secondary" id="setupBtn">Run Setup Wizard</button>
                 <button type="button" class="btn-secondary" id="logsBtn">View Logs</button>
+                <button type="button" class="btn-secondary" id="cecBtn">CEC Activity</button>
 
                 <div id="resetConfirm" class="hidden">
                     <div class="confirm-box" style="border-color: #dc3545;">
@@ -697,6 +795,10 @@ document.getElementById("setupBtn").addEventListener("click", function() {
 
 document.getElementById("logsBtn").addEventListener("click", function() {
     window.location.href = "/api/logs";
+});
+
+document.getElementById("cecBtn").addEventListener("click", function() {
+    window.location.href = "/cec";
 });
 
 // ---- Factory reset (with inline confirm) ----
@@ -950,6 +1052,10 @@ class WebHandler(BaseHTTPRequestHandler):
 
         if path == '/setup':
             self.send_html(SETUP_PAGE_HTML)
+            return
+
+        if path == '/cec':
+            self.send_html(render_cec_activity(read_cec_activity(), get_current_version()))
             return
 
         # iOS captive portal detection
