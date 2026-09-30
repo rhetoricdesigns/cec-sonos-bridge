@@ -139,6 +139,9 @@ The bridge never asks the TV to show it, but some TVs switch anyway. To see why:
 
 It lists every message between the TV, your other HDMI devices and the bridge, newest first, and highlights any that move the TV to the bridge's input.
 
+### Moved the bridge to a different HDMI port
+Restart it (admin panel → **Restart Service**) so it picks up its new input. While running, the bridge holds its HDMI connection so a TV waking up doesn't see it drop off and reappear.
+
 ### Need to reset to setup mode
 Create the force flag and reboot:
 ```bash
@@ -177,7 +180,7 @@ Works with any TV that supports HDMI-CEC:
 
 1. **startup.py** — Runs at boot, decides whether to enter AP mode or bridge mode
 2. **ap_mode.py** — Creates WiFi hotspot and serves the setup wizard
-3. **cec_bridge.py** — Joins HDMI-CEC as an audio system through the kernel's CEC device (`/dev/cec0`), calls Sonos API via `soco` library. It never claims the TV input, so other devices (Fire TV, Apple TV) keep control of what's on screen. Falls back to `cec-client` if `/dev/cec0` is missing.
+3. **cec_bridge.py** — Joins HDMI-CEC as an audio system through the kernel's CEC device (`/dev/cec0`), calls Sonos API via `soco` library. It never claims the TV input, so other devices (Fire TV, Apple TV) keep control of what's on screen, and it holds its HDMI connection so a TV waking up never sees it "switch on" (Samsung TVs switch to devices that do). Falls back to `cec-client` if `/dev/cec0` is missing.
 4. **web_server.py** — Serves the admin panel at port 80, including the CEC Activity page (`/cec`), which reads the bridge's CEC activity log (`/var/log/cec-sonos-bridge-cec.log`)
 5. **splash_screen.py** — Generates and displays TV splash screen with QR code
 

@@ -13,6 +13,7 @@ import os
 import queue
 import signal
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -268,9 +269,11 @@ class TestAnswersWhatLibcecUsedToAnswer(BridgeTestCase):
         self.receive('05:8D:01')
         self.assertEqual(self.cec.sent_text(), ['50:8E:01'])
 
-    def test_answers_samsung_vendor_query(self):
+    def test_declines_samsung_power_up_vendor_command(self):
+        # Answering it as Samsung's soundbars do (24:00:80) invites a Samsung TV to
+        # switch to the bridge's input after it wakes, as it does for its soundbars
         self.receive('05:A0:00:00:F0:23')
-        self.assertEqual(self.cec.sent_text(), ['50:A0:00:00:F0:24:00:80'])
+        self.assertEqual(self.cec.sent_text(), ['50:00:A0:03'])  # Feature Abort: invalid operand
 
     def test_announces_vendor_id_when_tv_announces_its_own(self):
         self.receive('0F:87:00:00:F0')
@@ -541,10 +544,55 @@ class TestRunBridge(unittest.TestCase):
             mock.patch.object(cec_bridge, 'background_threads', {}),
             mock.patch.object(cec_bridge, 'sonos_queue', queue.Queue()),
             mock.patch.object(cec_bridge, 'handle_volume'),
+            mock.patch.object(cec_bridge, 'hold_hdmi_connection', return_value=True),  # not this machine's HDMI
         ]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
+
+    def hdmi_holds(self):
+        return [c.args[0] for c in cec_bridge.hold_hdmi_connection.call_args_list]
+
+    def test_holds_the_hdmi_connection_and_lets_go_on_exit(self):
+        # so the TV's brief cuts while it wakes don't drop the bridge off HDMI-CEC
+        with mock.patch.object(cec_bridge, 'open_kernel_cec',
+                               return_value=FakeKernelDevice([frame('05:8F'), frame('05:71')])):
+            cec_bridge.run_bridge(self.CONFIG)
+        self.assertEqual(self.hdmi_holds(), [True, False])
+
+    def test_holds_the_hdmi_connection_only_once_it_has_a_tv_input(self):
+        dev = FakeKernelDevice([frame('05:8F'), frame('05:71')])
+        addresses = iter([0xFFFF, 0xFFFF, 0x2000])  # TV off at first
+        dev.physical_address = lambda: next(addresses, 0x2000)
+        with mock.patch.object(cec_bridge, 'open_kernel_cec', return_value=dev):
+            cec_bridge.run_bridge(self.CONFIG)
+        self.assertEqual(self.hdmi_holds(), [True, False])
+        self.assertEqual(dev.sent_text()[-2], '50:90:00')          # answered while waiting for HDMI
+        self.assertTrue(dev.sent_text()[-1].startswith('50:7A:'))  # and after holding it
+
+    def test_lets_go_and_holds_again_if_the_tv_input_is_lost_anyway(self):
+        # e.g. the TV's EDID couldn't be read while holding: the kernel must be able to find it again
+        dev = FakeKernelDevice([frame('05:8F'), frame('05:8F'), frame('05:8F')])
+        addresses = iter([0x2000, 0x2000, 0xFFFF, 0x2000])
+        dev.physical_address = lambda: next(addresses, 0x2000)
+        with mock.patch.object(cec_bridge, 'open_kernel_cec', return_value=dev):
+            cec_bridge.run_bridge(self.CONFIG)
+        self.assertEqual(self.hdmi_holds(), [True, False, True, False])
+
+    def test_a_failed_hold_is_neither_retried_nor_released(self):
+        cec_bridge.hold_hdmi_connection.return_value = False
+        with mock.patch.object(cec_bridge, 'open_kernel_cec',
+                               return_value=FakeKernelDevice([frame('05:8F'), frame('05:71')])):
+            cec_bridge.run_bridge(self.CONFIG)
+        self.assertEqual(self.hdmi_holds(), [True])
+
+    def test_cec_client_fallback_leaves_the_hdmi_connection_alone(self):
+        proc = mock.Mock()
+        proc.stdout = iter([])
+        with mock.patch.object(cec_bridge, 'open_kernel_cec', return_value=None), \
+                mock.patch.object(cec_bridge.subprocess, 'Popen', return_value=proc):
+            cec_bridge.run_bridge(self.CONFIG)
+        self.assertEqual(self.hdmi_holds(), [])
 
     def test_uses_kernel_device_and_closes_it_on_exit(self):
         dev = FakeKernelDevice([frame('05:44:41'), frame('45:44:6D'), frame('05:8F')])
@@ -588,6 +636,47 @@ class TestRunBridge(unittest.TestCase):
         self.run_sonos_queue()
         cec_bridge.handle_volume.assert_called_once_with(SPEAKER_IP, 'down')
         proc.terminate.assert_called_once()
+
+
+class TestHoldHdmiConnection(unittest.TestCase):
+    """The kernel's DRM sysfs switch for the HDMI port: 'on' holds it, 'detect' lets go."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for p in (mock.patch.object(cec_bridge, 'HDMI_CONNECTOR_STATUS',
+                                    os.path.join(self.tmp.name, 'card*-HDMI-A-1', 'status')),
+                  mock.patch.object(cec_bridge, 'log')):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def connector(self, card='card1'):
+        path = os.path.join(self.tmp.name, f'{card}-HDMI-A-1', 'status')
+        os.makedirs(os.path.dirname(path))
+        with open(path, 'w') as f:
+            f.write('connected\n')
+        return path
+
+    def read(self, path):
+        with open(path) as f:
+            return f.read()
+
+    def test_hold_and_release(self):
+        status = self.connector()
+        self.assertTrue(cec_bridge.hold_hdmi_connection(True))
+        self.assertEqual(self.read(status), 'on')
+        self.assertTrue(cec_bridge.hold_hdmi_connection(False))
+        self.assertEqual(self.read(status), 'detect')
+
+    def test_no_hdmi_connector(self):
+        self.assertFalse(cec_bridge.hold_hdmi_connection(True))
+        cec_bridge.log.warning.assert_called_once()
+
+    def test_kernel_refusing_is_reported_not_raised(self):
+        self.connector()
+        with mock.patch('builtins.open', side_effect=PermissionError(errno.EACCES, 'denied')):
+            self.assertFalse(cec_bridge.hold_hdmi_connection(True))
+        cec_bridge.log.warning.assert_called_once()
 
 
 class TestWifiWatchdog(unittest.TestCase):

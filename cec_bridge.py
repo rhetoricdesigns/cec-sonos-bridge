@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
 """
-CEC-Sonos Bridge v1.5.2
+CEC-Sonos Bridge v1.5.3
 Monitors HDMI-CEC for TV remote volume commands and controls Sonos speaker.
 Also runs a web server for admin access at http://sonosbridge.local
 
 Talks to the kernel's CEC device (/dev/cec0) directly, as a pure Audio System.
 Falls back to cec-client when /dev/cec0 is missing (legacy firmware CEC).
+
+Key improvements over v1.5.2 (a Samsung TV switched to the bridge's input
+about 20 seconds after it woke up, e.g. from Home on the Fire TV remote):
+  - Holds the HDMI connection once the bridge has its TV input.  A TV cuts
+    its HDMI connections for a moment while it wakes; a Pi Zero-3 checks the
+    connection only every 10 seconds, so the bridge dropped off HDMI-CEC and
+    came back about 10 seconds after the TV was on - like a device being
+    switched on, which a Samsung switches to.
+  - Declines the "powered up" vendor command a Samsung sends after waking,
+    instead of answering it as Samsung's own soundbars do.  Samsung TVs
+    switch to their soundbars' inputs after waking, and the bridge presents
+    itself as a Pulse-Eight device, not a Samsung one.
 
 Key improvements over v1.5.1:
   - CEC activity log: every message the bridge sends and receives (including
@@ -20,8 +32,7 @@ Key improvements over v1.5.0:
     <Active Source> for the Pi and the TV switches to the splash screen.
     The kernel device never does that on its own.
   - Answers the housekeeping messages libCEC used to answer for us (power
-    status, menu status, vendor ID, Samsung's audio-system query) and
-    Feature Aborts the rest
+    status, menu status, vendor ID) and Feature Aborts the rest
   - Sonos and WiFi calls run on their own threads, so a slow speaker never
     delays the replies the TV is waiting for
   - Keeps asking a TV that hasn't identified itself for its brand, and
@@ -58,7 +69,7 @@ CEC Opcodes handled:
     A4    = Request Short Audio Descriptor (declined)
     8D    = Menu Request
     8F    = Give Device Power Status
-    A0    = Vendor Command With ID (Samsung audio-system query)
+    A0    = Vendor Command With ID (declined, Samsung's "powered up" included)
     44:40 / 44:6B / 44:6D = Power keys (ignored - never switch the TV input)
 
   Outgoing:
@@ -88,6 +99,7 @@ import logging
 import logging.handlers
 import errno
 import fcntl
+import glob
 import queue
 import select
 import struct
@@ -172,6 +184,15 @@ CEC_OP_ALL_DEVTYPE_AUDIOSYSTEM = 0x08
 # Pulse-Eight: the vendor ID cec-client announced for the bridge, so the TV
 # keeps seeing the same device
 BRIDGE_VENDOR_ID = 0x001582
+
+# The HDMI port /dev/cec0 belongs to, as the kernel's display driver sees it.
+# A TV cuts its HDMI connections for a moment while it wakes up.  A Pi Zero-3
+# checks the connection only every 10 seconds, so the bridge used to drop off
+# HDMI-CEC with it and come back about 10 seconds after the TV was on - like a
+# device being switched on, which a Samsung then switches to.  Holding the
+# connection ("on") stops the kernel checking it, so the bridge keeps its CEC
+# address through those cuts; "detect" hands it back.  A reboot resets it.
+HDMI_CONNECTOR_STATUS = '/sys/class/drm/card*-HDMI-A-1/status'
 
 # Directed messages that need no answer: reports, key releases, and the power
 # and view-on requests that must never pull the TV input over to the bridge
@@ -582,10 +603,11 @@ def answer_core_message(frame):
     elif opcode == 0x8D:
         state = '01' if frame[2:3] == b'\x01' else '00'    # deactivate -> deactivated
         send_cec_command(f"{reply}:8E:{state}")            # Menu Status
-    elif opcode == 0xA0 and frame[2:6] == b'\x00\x00\xf0\x23':
-        # Samsung's audio-system query; same reply as libCEC's Samsung handler
-        send_cec_command(f"{reply}:A0:00:00:F0:24:00:80")
     elif opcode in (0x89, 0xA0):
+        # Vendor commands, including the "powered up" one a Samsung sends after
+        # waking (A0 00:00:F0 23).  Samsung's soundbars answer it with 24:00:80,
+        # and Samsung TVs switch to their soundbars' inputs after waking, so the
+        # bridge - a Pulse-Eight device - declines it like any other vendor's.
         send_cec_command(f"{reply}:00:{opcode:02X}:03")    # Feature Abort: invalid operand, as libCEC did
     elif opcode not in SILENT_OPCODES:
         send_cec_command(f"{reply}:00:{opcode:02X}:00")    # Feature Abort: unrecognized opcode
@@ -628,6 +650,42 @@ def announce_to_tv(osd_name):
 def format_physical_address(pa):
     """0x2000 -> '2.0.0.0' (TV input 2)"""
     return '.'.join(f'{(pa >> shift) & 0xF:x}' for shift in (12, 8, 4, 0))
+
+
+def hold_hdmi_connection(hold):
+    """Hold the HDMI connection as connected (True), or hand it back to the
+    kernel's detection (False).  Returns True if the kernel took the setting."""
+    paths = sorted(glob.glob(HDMI_CONNECTOR_STATUS))
+    if not paths:
+        log.warning("HDMI connector not found - can't hold the connection while the TV wakes")
+        return False
+    try:
+        with open(paths[0], 'w') as f:
+            f.write('on' if hold else 'detect')
+    except OSError as e:
+        log.warning(f"Could not {'hold' if hold else 'release'} the HDMI connection: {e}")
+        return False
+    return True
+
+
+def update_hdmi_hold(held):
+    """Hold the HDMI connection once the bridge has its TV input, and let go if the
+    input is lost anyway (say the TV's EDID failed to read), so the kernel can find
+    it again.  held: None until tried, then whether the hold took; returns the new value."""
+    has_input = cec_dev.physical_address() != CEC_PHYS_ADDR_INVALID
+    if held is None and has_input:
+        held = hold_hdmi_connection(True)
+        if held:
+            log.info("HDMI connection held: the bridge stays on HDMI-CEC while the TV wakes")
+            traffic_log.info("--- Holding the HDMI connection through the TV's brief cuts "
+                             "while it wakes up ---")
+    elif held and not has_input:
+        # Also the norm on a Pi 4/5: their hotplug interrupt bypasses the hold,
+        # but they notice the connection coming back at once
+        log.info("TV input lost while holding the HDMI connection - detecting it again")
+        hold_hdmi_connection(False)
+        held = None
+    return held
 
 
 def describe_operands(opcode, ops):
@@ -1113,10 +1171,10 @@ def run_bridge(config):
     hdmi_port = config.get('hdmi_port', '2')
 
     open_traffic_log()
-    traffic_log.info("--- Sonos Bridge v1.5.2 starting ---")
+    traffic_log.info("--- Sonos Bridge v1.5.3 starting ---")
 
     log.info("=" * 50)
-    log.info("CEC-Sonos Bridge v1.5.2 Active")
+    log.info("CEC-Sonos Bridge v1.5.3 Active")
     log.info(f"Speaker: {speaker_name} ({speaker_ip})")
     log.info(f"HDMI Port: {hdmi_port}")
     log.info(f"Admin: http://sonosbridge.local")
@@ -1130,6 +1188,7 @@ def run_bridge(config):
     sync_volume_from_sonos(speaker_ip)
 
     osd_name = speaker_name[:12].replace(' ', '')
+    hdmi_held = None  # None until the bridge has its TV input, then whether the hold worked
 
     try:
         cec_dev = open_kernel_cec(osd_name)
@@ -1163,6 +1222,7 @@ def run_bridge(config):
             log.info(f"CEC: {CEC_DEVICE} as Audio System at HDMI address {pa}")
             announce_to_tv(osd_name)
             while True:
+                hdmi_held = update_hdmi_hold(hdmi_held)
                 frame = cec_dev.receive(timeout_ms=1000)
                 if frame:
                     handle_cec_frame(frame, speaker_ip)
@@ -1187,6 +1247,8 @@ def run_bridge(config):
             with cec_lock:  # the keepalive thread may be transmitting
                 cec_dev.close()
                 cec_dev = None
+        if hdmi_held:
+            hold_hdmi_connection(False)  # the next start takes the TV input afresh
         if cec_proc:
             cec_proc.terminate()
             try:
@@ -1203,7 +1265,7 @@ def install_signal_handlers():
 
 def main():
     """Main entry point."""
-    log.info("CEC-Sonos Bridge v1.5.2 starting...")
+    log.info("CEC-Sonos Bridge v1.5.3 starting...")
 
     config = load_config()
     if not config:
