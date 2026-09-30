@@ -132,7 +132,9 @@ arp -a | grep raspberry
    ```
 
 ### TV switches to the Sonos Bridge screen
-The bridge never asks the TV to show it, but some TVs switch anyway. To see why:
+The bridge never asks the TV to show it, but some TVs switch anyway: a Samsung does it by itself a few seconds after another device (like a Fire TV) takes the screen. When that happens, the bridge hands the screen straight back to that device, so you may see the bridge's screen for a second. To look at the bridge's screen on purpose, pick it in the TV's source list more than two minutes after using another device.
+
+If it still happens, here is how to see why:
 1. Make it happen (e.g. press Home on the Fire TV remote)
 2. Open **http://sonosbridge.local/cec** (or Settings → CEC Activity in the admin panel)
 3. Tap **Copy** and send the text with your bug report

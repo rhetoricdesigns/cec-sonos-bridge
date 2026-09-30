@@ -72,6 +72,9 @@ class BridgeTestCase(unittest.TestCase):
             mock.patch.object(cec_bridge, 'sonos_queue', queue.Queue()),
             mock.patch.object(cec_bridge, 'handle_volume'),
             mock.patch.object(cec_bridge, 'handle_mute'),
+            mock.patch.object(cec_bridge, 'screen_owner', None),
+            mock.patch.object(cec_bridge, 'pending_snap_back', None),
+            mock.patch.object(cec_bridge, 'snap_back_times', []),
         ]
         for p in patches:
             p.start()
@@ -123,6 +126,89 @@ class TestNeverTakesOverTheTvInput(BridgeTestCase):
         self.receive('4F:82:10:00')  # Fire TV: <Active Source>
         self.receive('45:70:10:00')  # Fire TV -> Audio System: <System Audio Mode Request>
         self.assert_tv_input_not_claimed()
+
+
+class TestHandsTheScreenBack(BridgeTestCase):
+    """A Samsung switched to the bridge by itself ~9 s after the Fire TV took the screen.
+
+    The bridge is at 2.0.0.0 (FakeCEC) and the Fire TV at 3.0.0.0, as in the CEC
+    activity log that showed it.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.now = 1000.0
+        patch = mock.patch.object(cec_bridge.time, 'time', lambda: self.now)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def at(self, seconds, text=None):
+        """Move the clock to `seconds` after the start, receive a message, run the main loop's check."""
+        self.now = 1000.0 + seconds
+        if text:
+            self.receive(text)
+        cec_bridge.snap_back_if_due()
+
+    def fire_tv_takes_the_screen_then_tv_jumps_to_the_bridge(self, start=0):
+        self.at(start, '4F:82:30:00')                  # Fire TV: <Active Source> 3.0.0.0
+        self.at(start + 9.0, '0F:80:30:00:20:00')      # TV: <Routing Change> 3.0.0.0 -> 2.0.0.0
+        self.at(start + 9.2, '0F:86:20:00')            # TV: <Set Stream Path> 2.0.0.0
+
+    def test_hands_the_screen_back_to_the_device_the_tv_came_from(self):
+        self.fire_tv_takes_the_screen_then_tv_jumps_to_the_bridge()
+        self.assertEqual(self.cec.sent, [])            # lets the TV finish switching first
+        self.at(10.1)
+        self.assertEqual(self.cec.sent_text(), ['5F:86:30:00'])  # <Set Stream Path> 3.0.0.0
+        self.at(11.0)
+        self.at(20.0, '4F:82:30:00')                   # the Fire TV takes it back
+        self.assertEqual(self.cec.sent_text(), ['5F:86:30:00'])  # once
+        self.assert_tv_input_not_claimed()
+
+    def test_also_when_the_tv_only_announces_the_stream_path(self):
+        self.at(0, '4F:82:30:00')
+        self.at(9.0, '0F:86:20:00')
+        self.at(10.1)
+        self.assertEqual(self.cec.sent_text(), ['5F:86:30:00'])
+
+    def test_bridge_screen_chosen_later_is_left_alone(self):
+        self.at(0, '4F:82:30:00')
+        self.at(cec_bridge.SNAP_BACK_WINDOW + 1, '0F:80:30:00:20:00')
+        self.at(cec_bridge.SNAP_BACK_WINDOW + 5)
+        self.assertEqual(self.cec.sent, [])
+
+    def test_nothing_is_handed_back_once_the_tv_has_moved_on(self):
+        self.at(0, '4F:82:30:00')
+        self.at(9.0, '0F:80:30:00:20:00')
+        self.at(9.5, '0F:80:20:00:30:00')              # back on the Fire TV already
+        self.at(12.0)
+        self.assertEqual(self.cec.sent, [])
+
+    def test_never_hands_the_screen_to_a_device_the_tv_did_not_come_from(self):
+        self.at(0, '4F:82:30:00')
+        self.at(5.0, '0F:80:30:00:00:00')              # TV goes to its own apps
+        self.at(9.0, '0F:80:00:00:20:00')              # then to the bridge
+        self.at(12.0)
+        self.assertEqual(self.cec.sent, [])
+
+    def test_garbled_active_source_is_not_taken_for_a_device(self):
+        # The log also showed 4F:82:03:00:00:00 - too long for an <Active Source>
+        self.at(0, '4F:82:30:00')
+        self.at(5.0, '4F:82:03:00:00:00')
+        self.at(9.0, '0F:80:30:00:20:00')
+        self.at(10.1)
+        self.assertEqual(self.cec.sent_text(), ['5F:86:30:00'])
+
+    def test_stops_if_the_tv_keeps_switching_to_the_bridge(self):
+        for cycle in range(cec_bridge.SNAP_BACK_LIMIT + 1):
+            self.fire_tv_takes_the_screen_then_tv_jumps_to_the_bridge(start=cycle * 30)
+            self.at(cycle * 30 + 11)
+        self.assertEqual(self.cec.sent_text(), ['5F:86:30:00'] * cec_bridge.SNAP_BACK_LIMIT)
+
+    def test_waits_until_the_bridge_knows_its_input(self):
+        self.cec.phys_addr = 0xFFFF
+        self.fire_tv_takes_the_screen_then_tv_jumps_to_the_bridge()
+        self.at(11.0)
+        self.assertEqual(self.cec.sent, [])
 
 
 class TestKeepsExistingAudioBehaviour(BridgeTestCase):
@@ -578,6 +664,16 @@ class TestRunBridge(unittest.TestCase):
         with mock.patch.object(cec_bridge, 'open_kernel_cec', return_value=dev):
             cec_bridge.run_bridge(self.CONFIG)
         self.assertEqual(self.hdmi_holds(), [True, False, True, False])
+
+    def test_main_loop_hands_the_screen_back(self):
+        dev = FakeKernelDevice([frame('4F:82:30:00'), frame('0F:80:30:00:20:00'), frame('05:71')])
+        with mock.patch.object(cec_bridge, 'open_kernel_cec', return_value=dev), \
+                mock.patch.object(cec_bridge, 'SNAP_BACK_DELAY', 0), \
+                mock.patch.object(cec_bridge, 'screen_owner', None), \
+                mock.patch.object(cec_bridge, 'pending_snap_back', None), \
+                mock.patch.object(cec_bridge, 'snap_back_times', []):
+            cec_bridge.run_bridge(self.CONFIG)
+        self.assertIn('5F:86:30:00', dev.sent_text())
 
     def test_a_failed_hold_is_neither_retried_nor_released(self):
         cec_bridge.hold_hdmi_connection.return_value = False

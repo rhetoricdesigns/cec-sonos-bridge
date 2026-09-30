@@ -1,5 +1,5 @@
 {
-  "version": "1.5.3",
+  "version": "1.5.4",
   "updated": "2026-09-30",
-  "changelog": "Fixes a Samsung TV switching to the Sonos Bridge about 20 seconds after it wakes up (e.g. from Home on the Fire TV remote). The bridge now holds its HDMI connection through the TV's brief cuts while waking, and no longer answers Samsung's power-up check the way Samsung's own soundbars do."
+  "changelog": "When a Samsung TV switches to the Sonos Bridge by itself shortly after another device (like a Fire TV) takes the screen, the bridge now hands the screen straight back to that device."
 }

@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
 """
-CEC-Sonos Bridge v1.5.3
+CEC-Sonos Bridge v1.5.4
 Monitors HDMI-CEC for TV remote volume commands and controls Sonos speaker.
 Also runs a web server for admin access at http://sonosbridge.local
 
 Talks to the kernel's CEC device (/dev/cec0) directly, as a pure Audio System.
 Falls back to cec-client when /dev/cec0 is missing (legacy firmware CEC).
+
+Key improvements over v1.5.3:
+  - Hands the screen back.  A Samsung still switched to the bridge's input by
+    itself, about 9 seconds after the Fire TV took the screen, with the
+    bridge on HDMI-CEC throughout and asking for nothing.  The TV announces
+    the switch, so the bridge answers it with <Set Stream Path> for the
+    device the TV came from, which makes that device claim the screen again
+    (a Fire TV, like any Android device, accepts it from the audio system;
+    it would reject an <Active Source> sent on its behalf).  Only within two
+    minutes of that device taking the screen, and at most 3 times in 10
+    minutes, so the bridge's own screen can still be chosen on purpose.
 
 Key improvements over v1.5.2 (a Samsung TV switched to the bridge's input
 about 20 seconds after it woke up, e.g. from Home on the Fire TV remote):
@@ -80,6 +91,7 @@ CEC Opcodes handled:
     C2    = Report ARC Terminated (LG only)
     00    = Feature Abort (Samsung ARC decline, unsupported messages)
     87    = Device Vendor ID (when the TV announces its own)
+    86    = Set Stream Path (hands the screen back when the TV switches to the bridge)
     8E    = Menu Status
     90:00 = Report Power Status ON
 
@@ -211,6 +223,20 @@ SILENT_OPCODES = {
 # Smart keepalive tracking
 last_volume_command_time = 0
 last_volume_lock = Lock()
+
+# Handing the screen back.  A Samsung switches to the bridge's input by itself
+# some seconds after another device (the Fire TV) takes the screen - the bridge
+# never asks it to.  The TV announces the switch, so the bridge answers it with
+# <Set Stream Path> for the device the TV came from, which makes that device
+# claim the screen again.  Only shortly after a device took the screen, so the
+# bridge's own screen can still be picked from the TV's source list later on.
+SNAP_BACK_WINDOW = 120     # seconds after another device took the screen
+SNAP_BACK_DELAY = 1.0      # let the TV finish switching first
+SNAP_BACK_LIMIT = 3        # at most this many hand-backs...
+SNAP_BACK_PERIOD = 600     # ...in this many seconds, in case the TV insists
+screen_owner = None        # (physical address, time) of the device that last took the screen
+pending_snap_back = None   # (physical address, due time)
+snap_back_times = []
 
 # TV brand detection (set from CEC Vendor ID opcode 0x87)
 # Controls ARC accept/decline behaviour
@@ -619,8 +645,60 @@ def handle_cec_frame(frame, speaker_ip):
         log_cec_traffic(frame, sent=False)
     if frame[0] >> 4 == 0:
         ask_tv_vendor_id()  # the TV is awake, so it can tell us its brand
+    watch_tv_routing(frame)
     if not process_cec_line(format_cec_frame(frame), speaker_ip):
         answer_core_message(frame)
+
+
+def watch_tv_routing(frame):
+    """Keep track of which device has the screen, and notice the TV switching to
+    the bridge's input soon after another device took it (see SNAP_BACK_WINDOW)."""
+    global screen_owner, pending_snap_back
+    initiator, opcode = frame[0] >> 4, frame[1] if len(frame) > 1 else None
+    came_from = None
+    if opcode == 0x82 and len(frame) == 4 and initiator != 5:
+        target = (frame[2] << 8) | frame[3]          # <Active Source> from a player
+    elif opcode == 0x86 and len(frame) == 4 and initiator == 0:
+        target = (frame[2] << 8) | frame[3]          # <Set Stream Path> from the TV
+    elif opcode == 0x80 and len(frame) == 6 and initiator == 0:
+        came_from = (frame[2] << 8) | frame[3]       # <Routing Change> from the TV: old path,
+        target = (frame[4] << 8) | frame[5]          # new path
+    else:
+        return
+    bridge_pa = cec_dev.physical_address() if cec_dev else CEC_PHYS_ADDR_INVALID
+    if bridge_pa == CEC_PHYS_ADDR_INVALID:
+        return
+    now = time.time()
+    if target != bridge_pa:
+        # An HDMI device took the screen - or the TV's own apps (0.0.0.0) did
+        screen_owner = (target, now) if target not in (0x0000, CEC_PHYS_ADDR_INVALID) else None
+        pending_snap_back = None                   # the TV has moved on
+    elif (opcode != 0x82 and pending_snap_back is None and screen_owner
+          and now - screen_owner[1] <= SNAP_BACK_WINDOW
+          and came_from in (None, screen_owner[0])):
+        pending_snap_back = (screen_owner[0], now + SNAP_BACK_DELAY)
+
+
+def snap_back_if_due():
+    """Hand the screen back to the device the TV switched away from (see watch_tv_routing)."""
+    global pending_snap_back
+    if pending_snap_back is None or time.time() < pending_snap_back[1]:
+        return
+    target, _ = pending_snap_back
+    pending_snap_back = None
+    now = time.time()
+    snap_back_times[:] = [t for t in snap_back_times if now - t < SNAP_BACK_PERIOD]
+    pa = format_physical_address(target)
+    if len(snap_back_times) >= SNAP_BACK_LIMIT:
+        log.warning(f"TV keeps switching to the bridge - not handing the screen back to {pa} again")
+        traffic_log.info(f"--- The TV keeps switching to the bridge: stopped handing the screen "
+                         f"back to {pa} ---")
+        return
+    snap_back_times.append(now)
+    log.info(f"TV switched to the bridge by itself - handing the screen back to {pa}")
+    traffic_log.info(f"--- The TV switched to the bridge by itself: asking the device at {pa} "
+                     f"to take the screen back ---")
+    send_cec_command(f"tx 5F:86:{target >> 8:02X}:{target & 0xFF:02X}")  # <Set Stream Path>
 
 
 def ask_tv_vendor_id(force=False):
@@ -1171,10 +1249,10 @@ def run_bridge(config):
     hdmi_port = config.get('hdmi_port', '2')
 
     open_traffic_log()
-    traffic_log.info("--- Sonos Bridge v1.5.3 starting ---")
+    traffic_log.info("--- Sonos Bridge v1.5.4 starting ---")
 
     log.info("=" * 50)
-    log.info("CEC-Sonos Bridge v1.5.3 Active")
+    log.info("CEC-Sonos Bridge v1.5.4 Active")
     log.info(f"Speaker: {speaker_name} ({speaker_ip})")
     log.info(f"HDMI Port: {hdmi_port}")
     log.info(f"Admin: http://sonosbridge.local")
@@ -1226,6 +1304,7 @@ def run_bridge(config):
                 frame = cec_dev.receive(timeout_ms=1000)
                 if frame:
                     handle_cec_frame(frame, speaker_ip)
+                snap_back_if_due()
         else:
             for line in cec_proc.stdout:
                 line = line.strip()
@@ -1265,7 +1344,7 @@ def install_signal_handlers():
 
 def main():
     """Main entry point."""
-    log.info("CEC-Sonos Bridge v1.5.3 starting...")
+    log.info("CEC-Sonos Bridge v1.5.4 starting...")
 
     config = load_config()
     if not config:
