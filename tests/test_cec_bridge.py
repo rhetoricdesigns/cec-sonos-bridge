@@ -145,7 +145,8 @@ class TestNeverTakesOverTheTvInput(BridgeTestCase):
 
 
 class TestHandsTheScreenBack(BridgeTestCase):
-    """A Samsung switched to the bridge by itself ~9 s after the Fire TV took the screen.
+    """The TV switched to the bridge ~9 s after the Fire TV took the screen: the Fire TV
+    remote, with HDMI 2 saved as the Fire TV's input, sent it there by infrared.
 
     The bridge is at 2.0.0.0 (FakeCEC) and the Fire TV at 3.0.0.0, as in the CEC
     activity log that showed it.
@@ -206,7 +207,7 @@ class TestHandsTheScreenBack(BridgeTestCase):
         self.assertEqual(self.picture(), 'off')
 
     def test_bridge_chosen_right_after_another_device_counts_as_the_tv_jumping(self):
-        # Indistinguishable on HDMI-CEC from the Samsung's own jump, which came 5-11 s
+        # Indistinguishable on HDMI-CEC from the Fire TV remote's jump, which came 5-11 s
         # after the Fire TV took the screen: the screen goes back, the picture stays off
         self.at(0, '0F:80:00:00:30:00')                # the Fire TV input
         self.at(10, '0F:80:30:00:20:00')               # the bridge's, 10 s later

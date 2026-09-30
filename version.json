@@ -1,5 +1,5 @@
 {
   "version": "1.5.4",
   "updated": "2026-09-30",
-  "changelog": "The splash screen now shows only when you switch the TV to the bridge's input, so the TV gets no picture to jump to otherwise. And when a Samsung TV switches to the bridge by itself shortly after another device (like a Fire TV) takes the screen, the bridge hands the screen straight back to that device."
+  "changelog": "The splash screen now shows only when you switch the TV to the bridge's input. And if the TV is sent to the bridge shortly after another device (like a Fire TV) takes the screen, the bridge hands the screen straight back to that device. A Fire TV remote does that when the Fire TV has the wrong HDMI input saved (Settings > Equipment Control > Manage Equipment)."
 }

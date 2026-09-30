@@ -8,15 +8,19 @@ Talks to the kernel's CEC device (/dev/cec0) directly, as a pure Audio System.
 Falls back to cec-client when /dev/cec0 is missing (legacy firmware CEC).
 
 Key improvements over v1.5.3:
-  - Hands the screen back.  A Samsung still switched to the bridge's input by
-    itself, about 9 seconds after the Fire TV took the screen, with the
-    bridge on HDMI-CEC throughout and asking for nothing.  The TV announces
-    the switch, so the bridge answers it with <Set Stream Path> for the
-    device the TV came from, which makes that device claim the screen again
-    (a Fire TV, like any Android device, accepts it from the audio system;
-    it would reject an <Active Source> sent on its behalf).  Only within a
-    minute of that device taking the screen, and at most 3 times in 10
-    minutes, so the bridge's own screen can still be chosen on purpose.
+  - Hands the screen back.  The TV still switched to the bridge's input about
+    9 seconds after the Fire TV took the screen, with the bridge on HDMI-CEC
+    throughout and asking for nothing.  The cause turned out to be the Fire
+    TV remote: the Fire TV had HDMI 2, the bridge's input, saved as its own
+    (Settings > Equipment Control > Manage Equipment), so Home and app
+    buttons switched the TV there by infrared, which HDMI-CEC never sees.
+    The TV announces the switch, so the bridge answers it with
+    <Set Stream Path> for the device the TV came from, which makes that
+    device claim the screen again (a Fire TV, like any Android device,
+    accepts it from the audio system; it would reject an <Active Source>
+    sent on its behalf).  Only within a minute of that device taking the
+    screen, and at most 3 times in 10 minutes, so the bridge's own screen
+    can still be chosen on purpose.
   - Shows its picture (the splash screen with the admin panel's address)
     only while the TV shows its input because someone chose it; otherwise
     the TV gets no picture from the bridge, so there is nothing to switch to.
@@ -228,9 +232,10 @@ SILENT_OPCODES = {
 last_volume_command_time = 0
 last_volume_lock = Lock()
 
-# Handing the screen back.  A Samsung switches to the bridge's input by itself
-# some seconds after another device (the Fire TV) takes the screen - the bridge
-# never asks it to.  The TV announces the switch, so the bridge answers it with
+# Handing the screen back.  Something the bridge can't see can send the TV to its
+# input some seconds after another device takes the screen: a Fire TV remote with
+# the wrong HDMI input saved (Equipment Control) does it by infrared.  The bridge
+# never asks for it.  The TV announces the switch, so the bridge answers it with
 # <Set Stream Path> for the device the TV came from, which makes that device
 # claim the screen again.  Only shortly after a device took the screen, so the
 # bridge's own screen can still be picked from the TV's source list later on.
@@ -689,8 +694,8 @@ def apply_picture():
 
 def watch_tv_routing(frame):
     """Keep track of which device has the screen: show the bridge's picture while the
-    TV shows its input on purpose, and notice the TV switching to it by itself soon
-    after another device took the screen (see SNAP_BACK_WINDOW)."""
+    TV shows its input on purpose, and notice the TV being sent to it soon after
+    another device took the screen (see SNAP_BACK_WINDOW)."""
     global screen_owner, pending_snap_back
     initiator, opcode = frame[0] >> 4, frame[1] if len(frame) > 1 else None
     came_from = None
@@ -720,7 +725,7 @@ def watch_tv_routing(frame):
     elif opcode != 0x82 and pending_snap_back is None:
         if (screen_owner and now - screen_owner[1] <= SNAP_BACK_WINDOW
                 and came_from in (None, screen_owner[0])):
-            pending_snap_back = (screen_owner[0], now + SNAP_BACK_DELAY)  # it switched by itself
+            pending_snap_back = (screen_owner[0], now + SNAP_BACK_DELAY)  # sent here, not chosen
         elif not picture_wanted:
             set_picture(True)                      # chosen on purpose: show the splash screen
 
@@ -742,9 +747,10 @@ def snap_back_if_due():
         set_picture(True)  # it stays here, so show the splash screen rather than "no signal"
         return
     snap_back_times.append(now)
-    log.info(f"TV switched to the bridge by itself - handing the screen back to {pa}")
-    traffic_log.info(f"--- The TV switched to the bridge by itself: asking the device at {pa} "
-                     f"to take the screen back ---")
+    log.info(f"TV switched to the bridge soon after {pa} took the screen - handing it back")
+    traffic_log.info(f"--- The TV switched to the bridge soon after the device at {pa} took the "
+                     f"screen: asking it to take the screen back (a Fire TV with the wrong HDMI "
+                     f"input saved under Equipment Control does this) ---")
     send_cec_command(f"tx 5F:86:{target >> 8:02X}:{target & 0xFF:02X}")  # <Set Stream Path>
 
 

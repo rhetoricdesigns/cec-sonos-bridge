@@ -132,7 +132,9 @@ arp -a | grep raspberry
    ```
 
 ### TV switches to the Sonos Bridge screen
-The bridge never asks the TV to show it, but some TVs switch anyway: a Samsung does it by itself a few seconds after another device (like a Fire TV) takes the screen. So the bridge only sends a picture while you've chosen its input, and if the TV jumps there by itself, the bridge hands the screen straight back to that device (you may see a blank screen for a second). To look at the bridge's screen on purpose, pick its input more than a minute after using another device.
+If it happens when you press Home or an app button on a Fire TV remote, check which HDMI input the Fire TV has saved: on the Fire TV, go to **Settings → Equipment Control → Manage Equipment**. It must match the port the Fire TV is plugged into. The remote uses it to switch the TV's input by infrared, so if it names the bridge's port, it sends the TV to the bridge.
+
+The bridge itself never asks the TV to show it. It only sends a picture while you've chosen its input, and if the TV is sent there shortly after another device takes the screen, the bridge hands the screen straight back to that device (you may see a blank screen for a second). To look at the bridge's screen on purpose, pick its input more than a minute after using another device.
 
 If it still happens, here is how to see why:
 1. Make it happen (e.g. press Home on the Fire TV remote)
@@ -140,6 +142,9 @@ If it still happens, here is how to see why:
 3. Tap **Copy** and send the text with your bug report
 
 It lists every message between the TV, your other HDMI devices and the bridge, newest first, and highlights any that move the TV to the bridge's input.
+
+### TV says an audio device is on a port that doesn't support ARC
+That's the bridge: it tells the TV it's a sound system, which is how it gets the volume buttons. Dismiss the message and leave the bridge where it is; don't move it to the ARC port.
 
 ### Moved the bridge to a different HDMI port
 Restart it (admin panel → **Restart Service**) so it picks up its new input. While running, the bridge holds its HDMI connection so a TV waking up doesn't see it drop off and reappear.
