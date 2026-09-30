@@ -40,6 +40,15 @@ def frame(text):
     return bytes(int(b, 16) for b in text.split(':'))
 
 
+def fake_framebuffer_blank(test):
+    """An empty file standing in for /sys/class/graphics/fb0/blank, removed after the test."""
+    tmp = tempfile.TemporaryDirectory()
+    test.addCleanup(tmp.cleanup)
+    path = os.path.join(tmp.name, 'blank')
+    open(path, 'w').close()
+    return path
+
+
 class FakeCEC:
     """Stands in for the kernel CEC device and records what the bridge sends."""
 
@@ -75,10 +84,17 @@ class BridgeTestCase(unittest.TestCase):
             mock.patch.object(cec_bridge, 'screen_owner', None),
             mock.patch.object(cec_bridge, 'pending_snap_back', None),
             mock.patch.object(cec_bridge, 'snap_back_times', []),
+            mock.patch.object(cec_bridge, 'picture_wanted', False),
+            mock.patch.object(cec_bridge, 'FRAMEBUFFER_BLANK', fake_framebuffer_blank(self)),
         ]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
+
+    def picture(self):
+        """What the bridge last told the display driver: 'on', 'off', or None if nothing."""
+        with open(cec_bridge.FRAMEBUFFER_BLANK) as f:
+            return {'0': 'on', '4': 'off', '': None}[f.read()]
 
     def receive(self, text):
         cec_bridge.handle_cec_frame(frame(text), SPEAKER_IP)
@@ -163,6 +179,7 @@ class TestHandsTheScreenBack(BridgeTestCase):
         self.at(20.0, '4F:82:30:00')                   # the Fire TV takes it back
         self.assertEqual(self.cec.sent_text(), ['5F:86:30:00'])  # once
         self.assert_tv_input_not_claimed()
+        self.assertFalse(cec_bridge.picture_wanted)    # no splash screen for a jump it didn't ask for
 
     def test_also_when_the_tv_only_announces_the_stream_path(self):
         self.at(0, '4F:82:30:00')
@@ -170,11 +187,45 @@ class TestHandsTheScreenBack(BridgeTestCase):
         self.at(10.1)
         self.assertEqual(self.cec.sent_text(), ['5F:86:30:00'])
 
-    def test_bridge_screen_chosen_later_is_left_alone(self):
+    def test_bridge_screen_chosen_later_is_left_alone_and_shown(self):
         self.at(0, '4F:82:30:00')
         self.at(cec_bridge.SNAP_BACK_WINDOW + 1, '0F:80:30:00:20:00')
         self.at(cec_bridge.SNAP_BACK_WINDOW + 5)
         self.assertEqual(self.cec.sent, [])
+        self.assertEqual(self.picture(), 'on')         # the splash screen, with the admin panel's address
+
+    def test_splash_screen_goes_off_when_the_tv_moves_on(self):
+        later = cec_bridge.SNAP_BACK_WINDOW + 1
+        self.at(0, '0F:80:00:00:20:00')                # chosen from the TV's own apps
+        self.assertEqual(self.picture(), 'on')
+        self.at(30, '0F:80:20:00:30:00')               # then the Fire TV input
+        self.assertEqual(self.picture(), 'off')
+        self.at(30 + later, '0F:86:20:00')             # the bridge again, via the source list
+        self.assertEqual(self.picture(), 'on')
+        self.at(40 + later, '4F:82:30:00')             # Home on the Fire TV remote
+        self.assertEqual(self.picture(), 'off')
+
+    def test_bridge_chosen_right_after_another_device_counts_as_the_tv_jumping(self):
+        # Indistinguishable on HDMI-CEC from the Samsung's own jump, which came 5-11 s
+        # after the Fire TV took the screen: the screen goes back, the picture stays off
+        self.at(0, '0F:80:00:00:30:00')                # the Fire TV input
+        self.at(10, '0F:80:30:00:20:00')               # the bridge's, 10 s later
+        self.at(11.1)
+        self.assertEqual(self.cec.sent_text(), ['5F:86:30:00'])
+        self.assertNotEqual(self.picture(), 'on')
+        self.assertFalse(cec_bridge.picture_wanted)
+
+    def test_splash_screen_goes_off_when_the_tv_switches_off(self):
+        self.at(0, '0F:86:20:00')
+        self.at(30, '0F:36')                           # <Standby>
+        self.assertEqual(self.picture(), 'off')
+
+    def test_splash_screen_shows_when_the_tv_insists_on_the_bridge(self):
+        # after SNAP_BACK_LIMIT hand-backs the TV is left on the bridge: better the splash than "no signal"
+        for cycle in range(cec_bridge.SNAP_BACK_LIMIT + 1):
+            self.fire_tv_takes_the_screen_then_tv_jumps_to_the_bridge(start=cycle * 30)
+            self.at(cycle * 30 + 11)
+        self.assertEqual(self.picture(), 'on')
 
     def test_nothing_is_handed_back_once_the_tv_has_moved_on(self):
         self.at(0, '4F:82:30:00')
@@ -631,10 +682,34 @@ class TestRunBridge(unittest.TestCase):
             mock.patch.object(cec_bridge, 'sonos_queue', queue.Queue()),
             mock.patch.object(cec_bridge, 'handle_volume'),
             mock.patch.object(cec_bridge, 'hold_hdmi_connection', return_value=True),  # not this machine's HDMI
+            mock.patch.object(cec_bridge, 'FRAMEBUFFER_BLANK', fake_framebuffer_blank(self)),  # nor its display
+            mock.patch.object(cec_bridge, 'picture_wanted', False),
+            mock.patch.object(cec_bridge, 'screen_owner', None),
+            mock.patch.object(cec_bridge, 'pending_snap_back', None),
+            mock.patch.object(cec_bridge, 'snap_back_times', []),
         ]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
+
+    def picture(self):
+        with open(cec_bridge.FRAMEBUFFER_BLANK) as f:
+            return {'0': 'on', '4': 'off', '': None}[f.read()]
+
+    def test_splash_screen_is_off_until_the_bridge_input_is_chosen(self):
+        with mock.patch.object(cec_bridge, 'open_kernel_cec', return_value=FakeKernelDevice([frame('05:71')])):
+            cec_bridge.run_bridge(self.CONFIG)
+        self.assertEqual(self.picture(), 'off')
+
+    def test_splash_screen_state_is_reapplied(self):
+        # fbi setting its mode, or a reconnect, can turn the display back on behind the bridge's back
+        writes = []
+        with mock.patch.object(cec_bridge, 'open_kernel_cec',
+                               return_value=FakeKernelDevice([frame('05:71'), frame('05:71')])), \
+                mock.patch.object(cec_bridge, 'PICTURE_REFRESH', 0), \
+                mock.patch.object(cec_bridge, 'apply_picture', side_effect=lambda: writes.append(1)):
+            cec_bridge.run_bridge(self.CONFIG)
+        self.assertGreaterEqual(len(writes), 3)  # at start, on holding the connection, and each loop
 
     def hdmi_holds(self):
         return [c.args[0] for c in cec_bridge.hold_hdmi_connection.call_args_list]
@@ -668,12 +743,10 @@ class TestRunBridge(unittest.TestCase):
     def test_main_loop_hands_the_screen_back(self):
         dev = FakeKernelDevice([frame('4F:82:30:00'), frame('0F:80:30:00:20:00'), frame('05:71')])
         with mock.patch.object(cec_bridge, 'open_kernel_cec', return_value=dev), \
-                mock.patch.object(cec_bridge, 'SNAP_BACK_DELAY', 0), \
-                mock.patch.object(cec_bridge, 'screen_owner', None), \
-                mock.patch.object(cec_bridge, 'pending_snap_back', None), \
-                mock.patch.object(cec_bridge, 'snap_back_times', []):
+                mock.patch.object(cec_bridge, 'SNAP_BACK_DELAY', 0):
             cec_bridge.run_bridge(self.CONFIG)
         self.assertIn('5F:86:30:00', dev.sent_text())
+        self.assertEqual(self.picture(), 'off')
 
     def test_a_failed_hold_is_neither_retried_nor_released(self):
         cec_bridge.hold_hdmi_connection.return_value = False
@@ -732,6 +805,41 @@ class TestRunBridge(unittest.TestCase):
         self.run_sonos_queue()
         cec_bridge.handle_volume.assert_called_once_with(SPEAKER_IP, 'down')
         proc.terminate.assert_called_once()
+
+
+class TestSplashScreenSwitch(unittest.TestCase):
+    """The display driver's blank switch: 4 turns the HDMI picture off, 0 back on."""
+
+    def setUp(self):
+        for p in (mock.patch.object(cec_bridge, 'FRAMEBUFFER_BLANK', fake_framebuffer_blank(self)),
+                  mock.patch.object(cec_bridge, 'picture_wanted', False),
+                  mock.patch.object(cec_bridge, 'log'),
+                  mock.patch.object(cec_bridge, 'traffic_log')):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def written(self):
+        with open(cec_bridge.FRAMEBUFFER_BLANK) as f:
+            return f.read()
+
+    def test_on_and_off(self):
+        cec_bridge.set_picture(True)
+        self.assertEqual(self.written(), '0')
+        cec_bridge.set_picture(False)
+        self.assertEqual(self.written(), '4')
+
+    def test_changes_go_to_the_activity_log(self):
+        cec_bridge.set_picture(True)
+        cec_bridge.set_picture(True)
+        cec_bridge.set_picture(False)
+        lines = [c.args[0] for c in cec_bridge.traffic_log.info.call_args_list]
+        self.assertEqual(lines, ["--- Splash screen on: the TV is showing the bridge's input ---",
+                                 "--- Splash screen off ---"])
+
+    def test_a_display_without_the_switch_is_reported_not_raised(self):
+        with mock.patch.object(cec_bridge, 'FRAMEBUFFER_BLANK', '/nonexistent/fb0/blank'):
+            cec_bridge.set_picture(True)
+        cec_bridge.log.warning.assert_called_once()
 
 
 class TestHoldHdmiConnection(unittest.TestCase):

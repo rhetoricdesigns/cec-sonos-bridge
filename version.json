@@ -1,5 +1,5 @@
 {
   "version": "1.5.4",
   "updated": "2026-09-30",
-  "changelog": "When a Samsung TV switches to the Sonos Bridge by itself shortly after another device (like a Fire TV) takes the screen, the bridge now hands the screen straight back to that device."
+  "changelog": "The splash screen now shows only when you switch the TV to the bridge's input, so the TV gets no picture to jump to otherwise. And when a Samsung TV switches to the bridge by itself shortly after another device (like a Fire TV) takes the screen, the bridge hands the screen straight back to that device."
 }

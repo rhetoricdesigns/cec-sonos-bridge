@@ -14,9 +14,13 @@ Key improvements over v1.5.3:
     the switch, so the bridge answers it with <Set Stream Path> for the
     device the TV came from, which makes that device claim the screen again
     (a Fire TV, like any Android device, accepts it from the audio system;
-    it would reject an <Active Source> sent on its behalf).  Only within two
-    minutes of that device taking the screen, and at most 3 times in 10
+    it would reject an <Active Source> sent on its behalf).  Only within a
+    minute of that device taking the screen, and at most 3 times in 10
     minutes, so the bridge's own screen can still be chosen on purpose.
+  - Shows its picture (the splash screen with the admin panel's address)
+    only while the TV shows its input because someone chose it; otherwise
+    the TV gets no picture from the bridge, so there is nothing to switch to.
+    HDMI-CEC, and so volume control, is unaffected.
 
 Key improvements over v1.5.2 (a Samsung TV switched to the bridge's input
 about 20 seconds after it woke up, e.g. from Home on the Fire TV remote):
@@ -230,13 +234,24 @@ last_volume_lock = Lock()
 # <Set Stream Path> for the device the TV came from, which makes that device
 # claim the screen again.  Only shortly after a device took the screen, so the
 # bridge's own screen can still be picked from the TV's source list later on.
-SNAP_BACK_WINDOW = 120     # seconds after another device took the screen
+SNAP_BACK_WINDOW = 60      # seconds after another device took the screen
 SNAP_BACK_DELAY = 1.0      # let the TV finish switching first
 SNAP_BACK_LIMIT = 3        # at most this many hand-backs...
 SNAP_BACK_PERIOD = 600     # ...in this many seconds, in case the TV insists
 screen_owner = None        # (physical address, time) of the device that last took the screen
 pending_snap_back = None   # (physical address, due time)
 snap_back_times = []
+
+# The bridge's picture (the splash screen with the admin panel's address) is on
+# only while the TV shows the bridge's input because someone chose it.  The rest
+# of the time the TV gets no picture from the bridge - nothing to switch to -
+# while HDMI-CEC, and so volume control, carries on (the kernel's CEC keeps its
+# own power).  Written to the framebuffer's blank switch, which the display
+# driver turns into switching the HDMI output off (4) and on (0).
+FRAMEBUFFER_BLANK = '/sys/class/graphics/fb0/blank'
+PICTURE_REFRESH = 60       # seconds between re-applying it, in case something turned it back on
+picture_wanted = False
+picture_applied_at = 0
 
 # TV brand detection (set from CEC Vendor ID opcode 0x87)
 # Controls ARC accept/decline behaviour
@@ -650,12 +665,39 @@ def handle_cec_frame(frame, speaker_ip):
         answer_core_message(frame)
 
 
+def set_picture(on):
+    """Turn the bridge's picture on (the TV is showing its input on purpose) or off."""
+    global picture_wanted
+    if on != picture_wanted:
+        state = "on: the TV is showing the bridge's input" if on else "off"
+        log.info(f"Splash screen {state}")
+        traffic_log.info(f"--- Splash screen {state} ---")
+    picture_wanted = on
+    apply_picture()
+
+
+def apply_picture():
+    """Write picture_wanted to the display driver (also every PICTURE_REFRESH seconds)."""
+    global picture_applied_at
+    picture_applied_at = time.time()
+    try:
+        with open(FRAMEBUFFER_BLANK, 'w') as f:
+            f.write('0' if picture_wanted else '4')  # FB_BLANK_UNBLANK / FB_BLANK_POWERDOWN
+    except OSError as e:
+        log.warning(f"Could not turn the splash screen {'on' if picture_wanted else 'off'}: {e}")
+
+
 def watch_tv_routing(frame):
-    """Keep track of which device has the screen, and notice the TV switching to
-    the bridge's input soon after another device took it (see SNAP_BACK_WINDOW)."""
+    """Keep track of which device has the screen: show the bridge's picture while the
+    TV shows its input on purpose, and notice the TV switching to it by itself soon
+    after another device took the screen (see SNAP_BACK_WINDOW)."""
     global screen_owner, pending_snap_back
     initiator, opcode = frame[0] >> 4, frame[1] if len(frame) > 1 else None
     came_from = None
+    if opcode == 0x36 and initiator == 0:
+        if picture_wanted:
+            set_picture(False)                       # <Standby>: the TV is switching off
+        return
     if opcode == 0x82 and len(frame) == 4 and initiator != 5:
         target = (frame[2] << 8) | frame[3]          # <Active Source> from a player
     elif opcode == 0x86 and len(frame) == 4 and initiator == 0:
@@ -673,10 +715,14 @@ def watch_tv_routing(frame):
         # An HDMI device took the screen - or the TV's own apps (0.0.0.0) did
         screen_owner = (target, now) if target not in (0x0000, CEC_PHYS_ADDR_INVALID) else None
         pending_snap_back = None                   # the TV has moved on
-    elif (opcode != 0x82 and pending_snap_back is None and screen_owner
-          and now - screen_owner[1] <= SNAP_BACK_WINDOW
-          and came_from in (None, screen_owner[0])):
-        pending_snap_back = (screen_owner[0], now + SNAP_BACK_DELAY)
+        if picture_wanted:
+            set_picture(False)
+    elif opcode != 0x82 and pending_snap_back is None:
+        if (screen_owner and now - screen_owner[1] <= SNAP_BACK_WINDOW
+                and came_from in (None, screen_owner[0])):
+            pending_snap_back = (screen_owner[0], now + SNAP_BACK_DELAY)  # it switched by itself
+        elif not picture_wanted:
+            set_picture(True)                      # chosen on purpose: show the splash screen
 
 
 def snap_back_if_due():
@@ -693,6 +739,7 @@ def snap_back_if_due():
         log.warning(f"TV keeps switching to the bridge - not handing the screen back to {pa} again")
         traffic_log.info(f"--- The TV keeps switching to the bridge: stopped handing the screen "
                          f"back to {pa} ---")
+        set_picture(True)  # it stays here, so show the splash screen rather than "no signal"
         return
     snap_back_times.append(now)
     log.info(f"TV switched to the bridge by itself - handing the screen back to {pa}")
@@ -752,6 +799,7 @@ def update_hdmi_hold(held):
     it again.  held: None until tried, then whether the hold took; returns the new value."""
     has_input = cec_dev.physical_address() != CEC_PHYS_ADDR_INVALID
     if held is None and has_input:
+        apply_picture()  # the display driver may have turned the picture back on with the connection
         held = hold_hdmi_connection(True)
         if held:
             log.info("HDMI connection held: the bridge stays on HDMI-CEC while the TV wakes")
@@ -1299,12 +1347,15 @@ def run_bridge(config):
             pa = format_physical_address(bridge_phys_addr)
             log.info(f"CEC: {CEC_DEVICE} as Audio System at HDMI address {pa}")
             announce_to_tv(osd_name)
+            set_picture(False)  # until someone switches the TV to the bridge's input
             while True:
                 hdmi_held = update_hdmi_hold(hdmi_held)
                 frame = cec_dev.receive(timeout_ms=1000)
                 if frame:
                     handle_cec_frame(frame, speaker_ip)
                 snap_back_if_due()
+                if time.time() - picture_applied_at >= PICTURE_REFRESH:
+                    apply_picture()
         else:
             for line in cec_proc.stdout:
                 line = line.strip()

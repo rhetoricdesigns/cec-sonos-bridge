@@ -32,7 +32,7 @@ The Pi plugs into an HDMI port on your TV and pretends to be an "audio system." 
 - **Phone-friendly setup wizard** — No coding required
 - **Auto hotspot mode** — Creates WiFi network if it can't connect
 - **Admin panel** — Access at `sonosbridge.local`
-- **TV splash screen** — Shows QR code to admin panel
+- **TV splash screen** — Switch the TV to the bridge's input to see the admin panel's address and QR code
 - **Auto-recovery** — Falls back to setup mode if WiFi is lost
 - **OTA updates** — Update from the admin panel
 
@@ -132,7 +132,7 @@ arp -a | grep raspberry
    ```
 
 ### TV switches to the Sonos Bridge screen
-The bridge never asks the TV to show it, but some TVs switch anyway: a Samsung does it by itself a few seconds after another device (like a Fire TV) takes the screen. When that happens, the bridge hands the screen straight back to that device, so you may see the bridge's screen for a second. To look at the bridge's screen on purpose, pick it in the TV's source list more than two minutes after using another device.
+The bridge never asks the TV to show it, but some TVs switch anyway: a Samsung does it by itself a few seconds after another device (like a Fire TV) takes the screen. So the bridge only sends a picture while you've chosen its input, and if the TV jumps there by itself, the bridge hands the screen straight back to that device (you may see a blank screen for a second). To look at the bridge's screen on purpose, pick its input more than a minute after using another device.
 
 If it still happens, here is how to see why:
 1. Make it happen (e.g. press Home on the Fire TV remote)
@@ -184,7 +184,7 @@ Works with any TV that supports HDMI-CEC:
 2. **ap_mode.py** — Creates WiFi hotspot and serves the setup wizard
 3. **cec_bridge.py** — Joins HDMI-CEC as an audio system through the kernel's CEC device (`/dev/cec0`), calls Sonos API via `soco` library. It never claims the TV input, so other devices (Fire TV, Apple TV) keep control of what's on screen, and it holds its HDMI connection so a TV waking up never sees it "switch on" (Samsung TVs switch to devices that do). Falls back to `cec-client` if `/dev/cec0` is missing.
 4. **web_server.py** — Serves the admin panel at port 80, including the CEC Activity page (`/cec`), which reads the bridge's CEC activity log (`/var/log/cec-sonos-bridge-cec.log`)
-5. **splash_screen.py** — Generates and displays TV splash screen with QR code
+5. **splash_screen.py** — Generates and displays TV splash screen with QR code (the bridge turns the picture on only while the TV shows its input)
 
 CEC Commands intercepted:
 - `05:44:41` → Volume Up
