@@ -1778,6 +1778,16 @@ def discover_lg_tvs(timeout=3.0, fetch_names=True, sock=None):
 
 # --- The follower ---
 
+def take_echo(sent, value):
+    """If value is one we sent the TV (sent: (value, time), oldest first), forget it and
+    everything sent before it, and return True."""
+    for i, (sent_value, _) in enumerate(sent):
+        if sent_value == value:
+            del sent[:i + 1]
+            return True
+    return False
+
+
 class LGFollower:
     """LG mode: keeps the Sonos speaker's volume and mute in step with the LG TV's own.
 
@@ -2137,16 +2147,20 @@ class LGFollower:
             self.tv = {'volume': volume,
                        'muted': muted if muted is not None else before['muted'],
                        'sound_output': output or before['sound_output']}
-            skip, self.skip_first_report = self.skip_first_report, False
-            if skip or volume is None or volume < 0:
+            if self.skip_first_report:
+                self.skip_first_report = False
+                self.sent_volumes, self.sent_mutes = [], []
+                return
+            if volume is None or volume < 0:
                 return  # an ARC device owns the volume, or the TV didn't say: leave the speaker
             volume = min(volume, 100)
+            # Our own setVolume / setMute coming back, possibly an older one than the latest
+            # (the speaker has moved on since): each field either didn't change, or is an echo
             self.sent_volumes = [(v, t) for v, t in self.sent_volumes if now - t < self.ECHO_WINDOW]
             self.sent_mutes = [(m, t) for m, t in self.sent_mutes if now - t < self.ECHO_WINDOW]
-            # Our own setVolume / setMute coming back, possibly one older than the latest
-            echo = ((volume == before['volume'] or any(v == volume for v, _ in self.sent_volumes)) and
-                    (muted is None or muted == before['muted'] or any(m == muted for m, _ in self.sent_mutes)))
-            if echo:
+            volume_echo = volume == before['volume'] or take_echo(self.sent_volumes, volume)
+            mute_echo = muted is None or muted == before['muted'] or take_echo(self.sent_mutes, muted)
+            if volume_echo and mute_echo:
                 return
             with volume_lock:
                 sonos = (current_volume, is_muted)

@@ -150,6 +150,10 @@ class FakeLGTV:
         """The TV switches off: connections drop and the port stops answering."""
         listener, self.listener = self.listener, None
         if listener:
+            try:
+                listener.shutdown(socket.SHUT_RDWR)  # wakes the thread waiting in accept()
+            except OSError:
+                pass
             listener.close()
         with self.lock:
             clients, self.clients = self.clients, []
