@@ -122,8 +122,15 @@ import fcntl
 import glob
 import queue
 import select
+import socket
+import ssl
+import base64
+import hashlib
+import html
+import urllib.parse
+import urllib.request
 import struct
-from threading import Thread, Lock
+from threading import Thread, Lock, Event
 
 # Setup logging
 LOG_FILE = '/var/log/cec-sonos-bridge.log'
@@ -381,6 +388,7 @@ def handle_volume(speaker_ip, direction):
             last_volume_command_time = time.time()
         log.info(f"Volume {direction} -> {new_vol}%")
         report_audio_status()
+        tell_lg_tv()
     except Exception as e:
         log.error(f"Volume error: {e}")
 
@@ -399,8 +407,52 @@ def handle_mute(speaker_ip):
         state = "muted" if speaker.mute else "unmuted"
         log.info(f"Mute toggled -> {state}")
         report_audio_status()
+        tell_lg_tv()
     except Exception as e:
         log.error(f"Mute error: {e}")
+
+
+def read_sonos_level(speaker_ip):
+    """The speaker's (volume, muted), read from the speaker itself; also updates our copy."""
+    global current_volume, is_muted
+    import soco
+    speaker = soco.SoCo(speaker_ip)
+    volume, muted = speaker.volume, speaker.mute
+    with volume_lock:
+        current_volume = volume
+        is_muted = muted
+    return volume, muted
+
+
+def set_sonos_level(speaker_ip, volume, muted):
+    """Set the speaker to an exact volume and mute (LG mode), changing only what differs.
+    Returns True if it changed anything."""
+    global current_volume, is_muted
+    with volume_lock:
+        same_volume, same_mute = current_volume == volume, is_muted == muted
+    if same_volume and same_mute:
+        return False
+    import soco
+    speaker = soco.SoCo(speaker_ip)
+    if not same_volume:
+        speaker.volume = volume
+    if not same_mute:
+        speaker.mute = muted
+    with volume_lock:
+        current_volume = volume
+        is_muted = muted
+    report_audio_status()
+    return True
+
+
+def tell_lg_tv():
+    """LG mode: the TV remote's HDMI-CEC keys changed the speaker, so give the TV the
+    same number (only while connected to an LG TV; otherwise nothing happens)."""
+    follower = lg_follower
+    if follower is not None:
+        with volume_lock:
+            level = (current_volume, is_muted)
+        follower.speaker_changed(*level)
 
 
 def parse_tx_command(command):
@@ -1199,6 +1251,993 @@ def start_cec_monitor():
     log.info(f"CEC activity log ({scope}): {TRAFFIC_LOG_FILE}")
 
 
+# LG mode: follow an LG webOS TV's own volume and mute over Wi-Fi.
+#
+# An LG TV gives its remote's volume keys over HDMI-CEC only to a sound device on
+# its ARC port, and a speaker on optical would go silent there.  So with LG mode
+# on, the bridge follows the TV's own volume number through the TV's network API
+# (webOS "second screen", SSAP, a WebSocket on port 3001 or 3000) and sets the
+# speaker to the same number.  Off by default; with it off, the follower thread
+# only waits, and nothing here touches the speaker or the network.
+
+LG_TV_DEFAULTS = {'enabled': False, 'host': '', 'name': '', 'client_key': '', 'secure': None}
+LG_PORTS = {True: 3001, False: 3000}  # wss:// (2018+ firmware; the only one from 2023) / ws://
+LG_SSDP_ADDRESS = ('239.255.255.250', 1900)
+LG_SSDP_ST = 'urn:lge-com:service:webos-second-screen:1'
+LG_VOLUME_URI = 'ssap://audio/getVolume'
+
+# The pairing request, copied verbatim from aiowebostv (Home Assistant's webOS library):
+#   https://github.com/home-assistant-libs/aiowebostv/blob/f52c91bfe6c8ff1cd2639f59db8aa408320abe69/aiowebostv/handshake.py
+#   Copyright the aiowebostv authors, Apache License 2.0
+#   (https://github.com/home-assistant-libs/aiowebostv/blob/main/LICENSE)
+LG_REGISTRATION_PAYLOAD = {
+    "forcePairing": False,
+    "manifest": {
+        "appVersion": "1.1",
+        "manifestVersion": 1,
+        "permissions": [
+            "APP_TO_APP",
+            "CLOSE",
+            "CONTROL_AUDIO",
+            "CONTROL_DISPLAY",
+            "CONTROL_INPUT_JOYSTICK",
+            "CONTROL_INPUT_MEDIA_PLAYBACK",
+            "CONTROL_INPUT_MEDIA_RECORDING",
+            "CONTROL_INPUT_TEXT",
+            "CONTROL_INPUT_TV",
+            "CONTROL_MOUSE_AND_KEYBOARD",
+            "CONTROL_POWER",
+            "CONTROL_TV_SCREEN",
+            "LAUNCH",
+            "LAUNCH_WEBAPP",
+            "READ_APP_STATUS",
+            "READ_COUNTRY_INFO",
+            "READ_CURRENT_CHANNEL",
+            "READ_INPUT_DEVICE_LIST",
+            "READ_INSTALLED_APPS",
+            "READ_LGE_SDX",
+            "READ_LGE_TV_INPUT_EVENTS",
+            "READ_NETWORK_STATE",
+            "READ_NOTIFICATIONS",
+            "READ_POWER_STATE",
+            "READ_RUNNING_APPS",
+            "READ_SETTINGS",
+            "READ_TV_CHANNEL_LIST",
+            "READ_TV_CURRENT_TIME",
+            "READ_UPDATE_INFO",
+            "SEARCH",
+            "TEST_OPEN",
+            "TEST_PROTECTED",
+            "TEST_SECURE",
+            "UPDATE_FROM_REMOTE_APP",
+            "WRITE_NOTIFICATION_ALERT",
+            "WRITE_NOTIFICATION_TOAST",
+            "WRITE_SETTINGS",
+        ],
+    },
+    "pairingType": "PROMPT",
+}
+
+LG_HINT_ARC = ("Your TV is sending sound over HDMI ARC. For your Sonos, set Sound Out to Optical "
+               "(Settings > Sound > Sound Out).")
+LG_HINT_SPEAKERS = ("Your TV is playing sound through its own speakers. For your Sonos, set Sound Out "
+                    "to Optical (Settings > Sound > Sound Out).")
+LG_HINT_CONNECT_APPS = ("On the TV, turn on LG Connect Apps / TV On With Mobile (the name depends on the "
+                        "TV's age: look under Settings > General, or Settings > Network).")
+
+config_lock = Lock()  # shared with web_server.save_config (see start_web_server)
+lg_follower = None    # the LGFollower, created by main()
+
+
+def read_config_file():
+    """config.json as a dict ({} if there is none yet)."""
+    try:
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def write_config_atomic(config):
+    """Write config.json through a temporary file, so a power cut never leaves half a file."""
+    tmp = f'{CONFIG_FILE}.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(config, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, CONFIG_FILE)
+
+
+def load_lg_settings():
+    """The LG TV settings from config.json, with defaults for anything missing."""
+    settings = dict(LG_TV_DEFAULTS)
+    try:
+        stored = read_config_file().get('lg_tv')
+    except (OSError, ValueError) as e:
+        log.warning(f"LG TV: could not read the settings: {e}")
+        stored = None
+    if isinstance(stored, dict):
+        settings.update({key: stored[key] for key in LG_TV_DEFAULTS if key in stored})
+    return settings
+
+
+def save_lg_settings(**changes):
+    """Change LG TV settings: re-read config.json, update only its lg_tv part, write it
+    atomically.  Returns the new settings."""
+    with config_lock:
+        config = read_config_file()  # a damaged file raises, rather than being overwritten
+        settings = dict(LG_TV_DEFAULTS)
+        if isinstance(config.get('lg_tv'), dict):
+            settings.update({key: config['lg_tv'][key] for key in LG_TV_DEFAULTS
+                             if key in config['lg_tv']})
+        settings.update(changes)
+        config['lg_tv'] = settings
+        write_config_atomic(config)
+    return settings
+
+
+def is_valid_tv_host(host):
+    """An IP address or host name, nothing that could smuggle anything else into a request."""
+    return bool(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.\-]{0,252}', host or ''))
+
+
+# --- WebSocket client (RFC 6455), standard library only ---
+
+WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+WS_MAX_MESSAGE = 1024 * 1024  # volume messages are tiny; refuse anything silly
+WS_CONTINUATION, WS_TEXT, WS_BINARY, WS_CLOSE, WS_PING, WS_PONG = 0x0, 0x1, 0x2, 0x8, 0x9, 0xA
+
+
+class WebSocketError(Exception):
+    """The WebSocket handshake or a frame went wrong."""
+
+
+class WebSocketClosed(WebSocketError):
+    """The other end closed the connection."""
+
+
+def websocket_accept_key(key):
+    """What the server must answer in Sec-WebSocket-Accept for our Sec-WebSocket-Key."""
+    return base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+
+
+def mask_ws_payload(payload, mask):
+    """XOR payload with the 4-byte mask (masking and unmasking are the same)."""
+    if not payload:
+        return b''
+    key = (mask * (len(payload) // 4 + 1))[:len(payload)]
+    return (int.from_bytes(payload, 'big') ^ int.from_bytes(key, 'big')).to_bytes(len(payload), 'big')
+
+
+def encode_ws_frame(opcode, payload, mask=None, fin=True):
+    """One client frame.  Clients always mask, with a random 4-byte mask."""
+    mask = os.urandom(4) if mask is None else mask
+    header = bytearray([(0x80 if fin else 0) | opcode])
+    length = len(payload)
+    if length < 126:
+        header.append(0x80 | length)
+    elif length < 1 << 16:
+        header.append(0x80 | 126)
+        header += struct.pack('!H', length)
+    else:
+        header.append(0x80 | 127)
+        header += struct.pack('!Q', length)
+    return bytes(header) + mask + mask_ws_payload(payload, mask)
+
+
+def decode_ws_frame(buf):
+    """(fin, opcode, payload, size) of the first whole frame in buf, or None if it is incomplete."""
+    if len(buf) < 2:
+        return None
+    length, pos = buf[1] & 0x7F, 2
+    if length == 126:
+        if len(buf) < 4:
+            return None
+        length, pos = struct.unpack_from('!H', buf, 2)[0], 4
+    elif length == 127:
+        if len(buf) < 10:
+            return None
+        length, pos = struct.unpack_from('!Q', buf, 2)[0], 10
+    if length > WS_MAX_MESSAGE:
+        raise WebSocketError(f"frame too large ({length} bytes)")
+    mask = None
+    if buf[1] & 0x80:  # servers don't mask, but cope if one does
+        if len(buf) < pos + 4:
+            return None
+        mask, pos = bytes(buf[pos:pos + 4]), pos + 4
+    if len(buf) < pos + length:
+        return None
+    payload = bytes(buf[pos:pos + length])
+    if mask:
+        payload = mask_ws_payload(payload, mask)
+    return bool(buf[0] & 0x80), buf[0] & 0x0F, payload, pos + length
+
+
+class WebSocket:
+    """A small WebSocket client: text messages in and out, pings answered, pongs noted."""
+
+    def __init__(self, sock, received=b''):
+        self.sock = sock
+        self.buffer = bytearray(received)
+        self.fragments = None      # (opcode, [parts]) while a fragmented message arrives
+        self.send_lock = Lock()
+        self.last_pong = time.monotonic()
+        self.closed = False
+
+    @classmethod
+    def connect(cls, host, port, secure, timeout=5):
+        """Open ws://host:port/ (or wss:// with the TV's self-signed certificate)."""
+        sock = socket.create_connection((host, port), timeout=timeout)
+        try:
+            if secure:
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE  # TVs use self-signed certificates
+                sock = context.wrap_socket(sock, server_hostname=host)
+            key = base64.b64encode(os.urandom(16)).decode()
+            sock.sendall((f"GET / HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
+                          f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                          f"Sec-WebSocket-Version: 13\r\n\r\n").encode())
+            response = b''
+            while b'\r\n\r\n' not in response:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise WebSocketError("connection closed during the WebSocket handshake")
+                response += chunk
+                if len(response) > 16384:
+                    raise WebSocketError("WebSocket handshake answer too long")
+            head, received = response.split(b'\r\n\r\n', 1)
+            lines = head.decode('latin-1').split('\r\n')
+            status = lines[0].split()
+            if len(status) < 2 or status[1] != '101':
+                raise WebSocketError(f"WebSocket handshake refused: {lines[0]}")
+            headers = {}
+            for line in lines[1:]:
+                name, _, value = line.partition(':')
+                headers[name.strip().lower()] = value.strip()
+            if headers.get('sec-websocket-accept') != websocket_accept_key(key):
+                raise WebSocketError("WebSocket handshake answer doesn't match (Sec-WebSocket-Accept)")
+            return cls(sock, received)
+        except BaseException:
+            sock.close()
+            raise
+
+    def receive(self, timeout, interrupt=None):
+        """The next text message; None after timeout seconds, or as soon as the interrupt
+        socket has something to read.  Raises WebSocketClosed when the connection ends."""
+        deadline = time.monotonic() + timeout
+        while True:
+            message = self._next_message()
+            if message is not None:
+                return message
+            if not (isinstance(self.sock, ssl.SSLSocket) and self.sock.pending()):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                watch = [self.sock] if interrupt is None else [self.sock, interrupt]
+                readable = select.select(watch, [], [], remaining)[0]
+                if not readable or interrupt in readable:
+                    return None
+            try:
+                chunk = self.sock.recv(65536)
+            except (ssl.SSLWantReadError, socket.timeout):
+                continue  # half a TLS record so far
+            if not chunk:
+                self.closed = True
+                raise WebSocketClosed("the connection closed")
+            self.buffer += chunk
+
+    def _next_message(self):
+        """A whole text message from what has arrived, answering pings and closes on the way."""
+        while True:
+            frame = decode_ws_frame(self.buffer)
+            if frame is None:
+                return None
+            fin, opcode, payload, size = frame
+            del self.buffer[:size]
+            if opcode == WS_PING:
+                self._send(WS_PONG, payload)
+            elif opcode == WS_PONG:
+                self.last_pong = time.monotonic()
+            elif opcode == WS_CLOSE:
+                if not self.closed:
+                    self.closed = True
+                    try:
+                        self._send(WS_CLOSE, payload[:2])
+                    except OSError:
+                        pass
+                raise WebSocketClosed("the TV closed the connection")
+            elif opcode in (WS_TEXT, WS_BINARY):
+                if self.fragments is not None:
+                    raise WebSocketError("a new message started before the last one ended")
+                if not fin:
+                    self.fragments = (opcode, [payload])
+                elif opcode == WS_TEXT:
+                    return payload.decode('utf-8')
+            elif opcode == WS_CONTINUATION:
+                if self.fragments is None:
+                    raise WebSocketError("a message continued that never started")
+                self.fragments[1].append(payload)
+                if sum(len(part) for part in self.fragments[1]) > WS_MAX_MESSAGE:
+                    raise WebSocketError("message too large")
+                if fin:
+                    first, parts = self.fragments
+                    self.fragments = None
+                    if first == WS_TEXT:
+                        return b''.join(parts).decode('utf-8')
+            else:
+                raise WebSocketError(f"unknown WebSocket frame type {opcode}")
+
+    def send_text(self, text):
+        self._send(WS_TEXT, text.encode('utf-8'))
+
+    def ping(self):
+        self._send(WS_PING, b'')
+
+    def _send(self, opcode, payload):
+        with self.send_lock:
+            self.sock.sendall(encode_ws_frame(opcode, payload))
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            try:
+                self._send(WS_CLOSE, struct.pack('!H', 1000))
+            except OSError:
+                pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+# --- The TV's API (SSAP) ---
+
+class LGPairingError(Exception):
+    """The TV wouldn't let the bridge in.  reason: 'not_paired' (the TV wants to ask the
+    owner, and nobody pressed Pair), 'refused', 'timeout' or 'cancelled'."""
+
+    def __init__(self, reason, detail=''):
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason
+
+
+class LGTVConnection:
+    """One connection to an LG TV's second-screen API."""
+
+    def __init__(self, ws):
+        self.ws = ws
+        self.request_count = 0
+
+    def send(self, msg_type, msg_id, uri=None, payload=None):
+        message = {'type': msg_type, 'id': msg_id}
+        if uri:
+            message['uri'] = uri
+        if payload is not None:
+            message['payload'] = payload
+        self.ws.send_text(json.dumps(message))
+
+    def request(self, uri, payload=None):
+        """Ask the TV to do something; its answer comes back with the same id (we don't wait)."""
+        self.request_count += 1
+        self.send('request', f'req_{self.request_count}', uri, payload or {})
+
+    def subscribe_volume(self):
+        """The TV then reports its volume and mute under id 'volume', now and on every change."""
+        self.send('subscribe', 'volume', LG_VOLUME_URI)
+
+    def register(self, client_key, allow_prompt, timeout=10, prompt_timeout=60, on_prompt=None,
+                 should_stop=None):
+        """Log in with client_key.  With allow_prompt, a TV that doesn't know the key asks its
+        owner, and we wait up to prompt_timeout for them.  Returns the TV's client key."""
+        payload = dict(LG_REGISTRATION_PAYLOAD)
+        if client_key:
+            payload['client-key'] = client_key
+        self.send('register', 'register_0', payload=payload)
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LGPairingError('timeout')
+            text = self.ws.receive(min(remaining, 1.0))
+            if should_stop and should_stop():
+                raise LGPairingError('cancelled')
+            try:
+                message = json.loads(text) if text else None
+            except ValueError:
+                message = None
+            if not isinstance(message, dict) or message.get('id', 'register_0') != 'register_0':
+                continue
+            answer = message.get('payload') if isinstance(message.get('payload'), dict) else {}
+            if message.get('type') == 'registered':
+                return answer.get('client-key') or client_key
+            if message.get('type') == 'error':
+                raise LGPairingError('refused', str(message.get('error', '')))
+            if message.get('type') == 'response' and answer.get('pairingType') == 'PROMPT':
+                if not allow_prompt:
+                    raise LGPairingError('not_paired')
+                if on_prompt:
+                    on_prompt()
+                deadline = time.monotonic() + prompt_timeout
+
+    def close(self):
+        self.ws.close()
+
+
+def parse_lg_volume(payload):
+    """(volume, muted, sound output) from a getVolume answer, old or new webOS; None for
+    anything it doesn't say.  Volume is -1 while an ARC device owns the volume."""
+    if not isinstance(payload, dict):
+        return None, None, None
+    status = payload.get('volumeStatus')
+    status = status if isinstance(status, dict) else payload
+    volume = status.get('volume')
+    volume = int(volume) if isinstance(volume, (int, float)) and not isinstance(volume, bool) else None
+    muted = None
+    for source in (status, payload):
+        for key in ('muteStatus', 'muted', 'mute'):
+            if isinstance(source.get(key), bool):
+                muted = source[key]
+                break
+        if muted is not None:
+            break
+    output = status.get('soundOutput') or payload.get('soundOutput') or payload.get('scenario')
+    return volume, muted, output if isinstance(output, str) else None
+
+
+def describe_lg_sound_output(output):
+    """'external_optical' or 'mastervolume_ext_speaker_arc' -> 'Optical' or 'HDMI ARC'."""
+    if not output:
+        return None
+    text = output.lower()
+    for pattern, label in (('arc', 'HDMI ARC'), ('optical', 'Optical'), ('headphone', 'Headphones'),
+                           ('bt_', 'Bluetooth'), ('bluetooth', 'Bluetooth'), ('lineout', 'Line out'),
+                           ('tv_speaker', 'TV speakers')):
+        if pattern in text:
+            return label
+    return output
+
+
+def lg_sound_output_hint(volume, output):
+    """What the owner should change on the TV, if the Sonos can't follow it like this."""
+    label = describe_lg_sound_output(output)
+    if volume == -1 or label == 'HDMI ARC':
+        return LG_HINT_ARC
+    if label == 'TV speakers':
+        return LG_HINT_SPEAKERS
+    return None
+
+
+# --- Finding the TV (SSDP) ---
+
+def parse_ssdp_reply(data, address):
+    """An LG TV from one SSDP reply: {'host', 'name', 'location', 'uuid'}, or None."""
+    text = data.decode('utf-8', 'replace')
+    lines = text.replace('\r\n', '\n').split('\n')
+    if not lines[0].upper().startswith('HTTP/') or ' 200' not in lines[0]:
+        return None
+    headers = {}
+    for line in lines[1:]:
+        name, sep, value = line.partition(':')
+        if sep:
+            headers[name.strip().lower()] = value.strip()
+    if 'webos-second-screen' not in headers.get('st', '') + headers.get('usn', ''):
+        return None
+    uuid = headers.get('usn', '').split('::')[0]
+    return {'host': address[0], 'name': '', 'location': headers.get('location', ''),
+            'uuid': uuid[5:] if uuid.startswith('uuid:') else uuid}
+
+
+def fetch_lg_tv_name(location, host, timeout=2):
+    """The TV's friendly name from its UPnP description (only from the TV itself), or ''."""
+    if urllib.parse.urlparse(location).hostname != host:
+        return ''
+    try:
+        with urllib.request.urlopen(location, timeout=timeout) as response:
+            text = response.read(65536).decode('utf-8', 'replace')
+    except Exception:
+        return ''
+    match = re.search(r'<friendlyName>(.*?)</friendlyName>', text, re.S)
+    return html.unescape(match.group(1)).strip()[:60] if match else ''
+
+
+def discover_lg_tvs(timeout=3.0, fetch_names=True, sock=None):
+    """LG webOS TVs answering an SSDP search within timeout seconds."""
+    request = ('M-SEARCH * HTTP/1.1\r\n'
+               f'HOST: {LG_SSDP_ADDRESS[0]}:{LG_SSDP_ADDRESS[1]}\r\n'
+               'MAN: "ssdp:discover"\r\n'
+               'MX: 2\r\n'
+               f'ST: {LG_SSDP_ST}\r\n\r\n').encode()
+    if sock is None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    tvs = {}
+    try:
+        sock.sendto(request, LG_SSDP_ADDRESS)
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
+            try:
+                data, address = sock.recvfrom(4096)
+            except socket.timeout:
+                break
+            tv = parse_ssdp_reply(data, address)
+            if tv and tv['host'] not in tvs:
+                tvs[tv['host']] = tv
+    finally:
+        sock.close()
+    if fetch_names:
+        for tv in tvs.values():
+            if tv['location']:
+                tv['name'] = fetch_lg_tv_name(tv['location'], tv['host'])
+    return list(tvs.values())
+
+
+# --- The follower ---
+
+class LGFollower:
+    """LG mode: keeps the Sonos speaker's volume and mute in step with the LG TV's own.
+
+    One daemon thread.  It waits while LG mode is off or no TV is paired; otherwise it
+    connects to the TV, sets the TV to the speaker's level, then follows the TV's
+    volume reports.  The speaker is only ever changed by jobs on the Sonos queue, at
+    most one waiting at a time, each applying the latest level the TV reported - so
+    holding a volume button costs a few Sonos calls, not one per step.
+    """
+
+    RETRY_FIRST = 5        # seconds before reconnecting, doubling each time...
+    RETRY_MAX = 60         # ...up to this
+    CONNECT_TIMEOUT = 5
+    REGISTER_TIMEOUT = 10
+    PAIR_TIMEOUT = 60      # how long the owner has to choose Allow on the TV
+    PING_INTERVAL = 30
+    PONG_TIMEOUT = 10
+    READ_TIMEOUT = 1.0     # how often the connection loop looks up from reading
+    SYNC_TIMEOUT = 5       # waiting for the Sonos queue to read the speaker's level
+    SETTLE_TIME = 1.0      # log a change once the volume has been still this long
+    ECHO_WINDOW = 2.0      # a report matching what we just sent the TV is its echo
+
+    def __init__(self, speaker_ip, ports=None):
+        self.speaker_ip = speaker_ip
+        self.ports = dict(ports or LG_PORTS)
+        self.lock = Lock()
+        self.settings = load_lg_settings()
+        self.state, self.message = 'off', "LG mode is off."
+        self.tv = {'volume': None, 'muted': None, 'sound_output': None}
+        self.last_change = None       # time.time() of the last change the TV reported
+        self.pairing = {'state': 'idle', 'message': ''}
+        self.pair_failures = 0
+        self.pair_request = None      # (host, name) when the owner pressed Pair
+        self.needs_pairing = False    # the TV wants to ask its owner: wait for Pair
+        self.target = None            # (volume, muted) the speaker should have
+        self.job_queued = False
+        self.sent_volumes, self.sent_mutes = [], []  # (value, time) we sent the TV
+        self.outbox = None            # (volume, muted) to send the TV
+        self.connected = False
+        self.was_connected = False    # this attempt got as far as following the TV
+        self.skip_first_report = False
+        self.unsettled = None         # (volume, muted) not logged yet, and when it came
+        self.reconfigure = False
+        self.stopping = False
+        self.thread = None
+        self.changed = Event()
+        self.wake_reader, self.wake_writer = socket.socketpair()
+        self.wake_reader.setblocking(False)
+        self.wake_writer.setblocking(False)
+
+    # -- called from other threads --
+
+    def start(self):
+        if self.thread is None or not self.thread.is_alive():
+            self.stopping = False
+            self.thread = Thread(target=self.run, name='lg_follower', daemon=True)
+            self.thread.start()
+
+    def stop(self, timeout=5):
+        self.stopping = True
+        self._poke()
+        if self.thread is not None:
+            self.thread.join(timeout)
+
+    def set_enabled(self, enabled):
+        self._save(enabled=bool(enabled))
+        with self.lock:
+            if enabled:
+                self.needs_pairing = False  # one more try with the saved key
+            self.reconfigure = True
+        self._poke()
+
+    def forget(self):
+        self._save(host='', name='', client_key='', secure=None)
+        with self.lock:
+            self.needs_pairing = False
+            self.pair_failures = 0
+            self.pairing = {'state': 'idle', 'message': ''}
+            self.reconfigure = True
+        self._poke()
+
+    def request_pairing(self, host, name=''):
+        """Start pairing with the TV at host (the result shows in status()['pairing'])."""
+        host = (host or '').strip()
+        if not is_valid_tv_host(host):
+            raise ValueError(host)
+        with self.lock:
+            self.pair_request = (host, str(name or '')[:60])
+            self.pairing = {'state': 'connecting', 'message': f"Connecting to the TV at {host}..."}
+            self.reconfigure = True
+        self._poke()
+
+    def find_tvs(self):
+        return discover_lg_tvs()
+
+    def speaker_changed(self, volume, muted):
+        """The speaker changed by other means (HDMI-CEC keys): give the TV the same number."""
+        with self.lock:
+            if not self.connected:
+                return
+            self.outbox = (volume, muted)
+        self._poke()
+
+    def status(self):
+        """Everything the admin panel shows, as plain data."""
+        with self.lock:
+            settings = self.settings
+            tv = dict(self.tv)
+            connected = self.connected
+            result = {
+                'enabled': bool(settings['enabled']),
+                'host': settings['host'],
+                'name': settings['name'],
+                'paired': bool(settings['host'] and settings['client_key']),
+                'state': self.state,
+                'message': self.message,
+                'connected': connected,
+                'pairing': dict(self.pairing),
+                'last_change_ago': (None if self.last_change is None
+                                    else max(0, int(time.time() - self.last_change))),
+            }
+            failures = self.pair_failures
+        with volume_lock:
+            sonos = (current_volume, is_muted)
+        hints = []
+        if connected:
+            hint = lg_sound_output_hint(tv['volume'], tv['sound_output'])
+            if hint:
+                hints.append(hint)
+        if failures >= 2 or result['state'] == 'refused':
+            hints.append(LG_HINT_CONNECT_APPS)
+        result.update({
+            'tv_volume': tv['volume'] if connected else None,
+            'tv_muted': tv['muted'] if connected else None,
+            'sound_output': describe_lg_sound_output(tv['sound_output']) if connected else None,
+            'sonos_volume': sonos[0],
+            'sonos_muted': sonos[1],
+            'hints': hints,
+        })
+        return result
+
+    def _save(self, **changes):
+        settings = save_lg_settings(**changes)
+        with self.lock:
+            self.settings = settings
+
+    def _poke(self):
+        """Wake the follower thread, whether it is waiting or reading from the TV."""
+        self.changed.set()
+        try:
+            self.wake_writer.send(b'.')
+        except OSError:
+            pass  # already full of wake-ups
+
+    # -- the follower thread --
+
+    def run(self):
+        delay = self.RETRY_FIRST
+        while not self.stopping:
+            self.changed.clear()
+            self._drain_wakeups()
+            with self.lock:
+                self.reconfigure = False
+                request, self.pair_request = self.pair_request, None
+                settings = dict(self.settings)
+                needs_pairing = self.needs_pairing
+            if request:
+                self._pair(*request)
+                continue
+            if not settings['enabled']:
+                self._set_state('off', "LG mode is off.")
+                self.changed.wait()
+                continue
+            if not settings['host'] or not settings['client_key'] or needs_pairing:
+                if self.state not in ('not_paired', 'pair_refused'):
+                    self._set_state('not_paired', "Not paired with a TV yet: press Find my TV, then Pair.")
+                self.changed.wait()
+                continue
+            self.was_connected = False
+            try:
+                self._follow(settings)
+            except LGPairingError as e:
+                if e.reason in ('not_paired', 'refused'):
+                    # Don't keep asking on the TV: wait for the owner to press Pair
+                    with self.lock:
+                        self.needs_pairing = True
+                    if e.reason == 'refused':
+                        self._set_state('pair_refused', "The TV refused the bridge. Press Pair to try again.")
+                    else:
+                        self._set_state('not_paired', "The TV has forgotten the bridge. Press Pair, then "
+                                                      "choose Allow on the TV.")
+                    continue
+                if e.reason == 'timeout':
+                    self._set_state('unreachable', "The TV didn't answer. Trying again...")
+            except ConnectionRefusedError:
+                self._set_state('refused', "The TV refused the connection. It may be turning off or on, "
+                                           "or LG Connect Apps is off on the TV.")
+            except (OSError, WebSocketError) as e:
+                if self.was_connected:
+                    self._set_state('unreachable', "Lost the TV (turned off?). Trying again...")
+                else:
+                    self._set_state('unreachable', "Can't reach the TV: it's off, or not on this Wi-Fi.",
+                                    detail=e)
+            except Exception as e:
+                log.exception(f"LG TV: unexpected error: {e}")
+                self._set_state('error', f"Something went wrong: {e}")
+            if self.stopping or self.reconfigure:
+                delay = self.RETRY_FIRST
+                continue
+            if self.was_connected:
+                delay = self.RETRY_FIRST
+            self.changed.wait(delay)
+            delay = min(delay * 2, self.RETRY_MAX)
+        self._set_state('off', "Stopped.")
+
+    def _set_state(self, state, message, detail=None):
+        with self.lock:
+            changed = (state, message) != (self.state, self.message)
+            self.state, self.message = state, message
+        if changed:
+            log.info(f"LG TV: {message}" + (f" ({detail})" if detail else ""))
+
+    def _set_pairing(self, state, message):
+        with self.lock:
+            self.pairing = {'state': state, 'message': message}
+
+    def _interrupted(self):
+        return self.stopping or self.reconfigure
+
+    def _drain_wakeups(self):
+        try:
+            while self.wake_reader.recv(4096):
+                pass
+        except OSError:
+            pass
+
+    def _connect(self, host, secure_first):
+        """Connect over wss:// then ws:// (or the one that worked last time first)."""
+        order = (False, True) if secure_first is False else (True, False)
+        errors = []
+        for secure in order:
+            try:
+                ws = WebSocket.connect(host, self.ports[secure], secure, timeout=self.CONNECT_TIMEOUT)
+            except (OSError, WebSocketError) as e:
+                errors.append(e)
+                continue
+            return LGTVConnection(ws), secure
+        # Only one of the two ports is open on most TVs: report the other error if there is one
+        others = [e for e in errors if not isinstance(e, ConnectionRefusedError)]
+        raise (others or errors)[0]
+
+    def _follow(self, settings):
+        """One connection: log in, set the TV to the speaker's level, then follow the TV."""
+        host = settings['host']
+        self._set_state('connecting', f"Connecting to the TV at {host}...")
+        conn, secure = self._connect(host, settings['secure'])
+        try:
+            key = conn.register(settings['client_key'], allow_prompt=False,
+                                timeout=self.REGISTER_TIMEOUT, should_stop=self._interrupted)
+            if secure != settings['secure'] or key != settings['client_key']:
+                self._save(secure=secure, client_key=key)
+            with self.lock:
+                self.connected = True
+                self.tv = {'volume': None, 'muted': None, 'sound_output': None}
+                self.sent_volumes, self.sent_mutes = [], []
+                self.outbox = None
+                self.skip_first_report = False
+            self.was_connected = True
+            self._set_state('connected', f"Connected to {settings['name'] or 'the TV at ' + host}.")
+            self._sync_tv_to_speaker(conn)
+            conn.subscribe_volume()
+            self._read_loop(conn)
+        finally:
+            with self.lock:
+                self.connected = False
+                self.outbox = None
+            conn.close()
+            self._log_settled(force=True)
+
+    def _sync_tv_to_speaker(self, conn):
+        """On connecting, the TV takes the speaker's level, so turning the TV on never makes
+        the speaker jump."""
+        done, level = Event(), []
+
+        def read_speaker():
+            try:
+                level.append(read_sonos_level(self.speaker_ip))
+            finally:
+                done.set()
+
+        sonos_queue.put((read_speaker, ()))
+        if not done.wait(self.SYNC_TIMEOUT) or not level:
+            log.warning("LG TV: could not read the Sonos volume, so the TV keeps its own")
+            return
+        self._send_level(conn, *level[0])
+        # The first report may still carry the TV's old level: following it would make
+        # the speaker jump.  The TV reports again once it has taken the new one.
+        with self.lock:
+            self.skip_first_report = True
+
+    def _send_level(self, conn, volume, muted):
+        """Set the TV to the speaker's level, remembering it so its echo is recognised."""
+        now = time.monotonic()
+        with self.lock:
+            send_volume = volume != self.tv['volume']
+            send_mute = muted != self.tv['muted']
+            if send_volume:
+                self.sent_volumes.append((volume, now))
+            if send_mute:
+                self.sent_mutes.append((muted, now))
+        if send_volume:
+            conn.request('ssap://audio/setVolume', {'volume': volume})
+        if send_mute:
+            conn.request('ssap://audio/setMute', {'mute': muted})
+
+    def _read_loop(self, conn):
+        """Follow the TV until told to stop or reconfigure, or the connection fails."""
+        last_ping = time.monotonic()
+        ping_sent = None
+        while not self._interrupted():
+            text = conn.ws.receive(self.READ_TIMEOUT, interrupt=self.wake_reader)
+            self._drain_wakeups()
+            if text is not None:
+                self._on_message(text)
+            with self.lock:
+                outgoing, self.outbox = self.outbox, None
+            if outgoing:
+                self._send_level(conn, *outgoing)
+            now = time.monotonic()
+            if ping_sent is not None and conn.ws.last_pong >= ping_sent:
+                ping_sent = None
+            if ping_sent is None and now - last_ping >= self.PING_INTERVAL:
+                conn.ws.ping()
+                ping_sent = last_ping = now
+            elif ping_sent is not None and now - ping_sent >= self.PONG_TIMEOUT:
+                raise WebSocketError("the TV stopped answering")
+            self._log_settled()
+
+    def _on_message(self, text):
+        try:
+            message = json.loads(text)
+        except ValueError:
+            return
+        if not isinstance(message, dict) or message.get('id') != 'volume':
+            return
+        if message.get('type') == 'response':
+            self._on_volume(message.get('payload'))
+        elif message.get('type') == 'error':
+            log.warning(f"LG TV: the TV won't report its volume: {message.get('error')}")
+
+    def _on_volume(self, payload):
+        """The TV reported its volume: give the speaker the same level (via the Sonos queue)."""
+        volume, muted, output = parse_lg_volume(payload)
+        now = time.monotonic()
+        with self.lock:
+            before = self.tv
+            self.tv = {'volume': volume,
+                       'muted': muted if muted is not None else before['muted'],
+                       'sound_output': output or before['sound_output']}
+            skip, self.skip_first_report = self.skip_first_report, False
+            if skip or volume is None or volume < 0:
+                return  # an ARC device owns the volume, or the TV didn't say: leave the speaker
+            volume = min(volume, 100)
+            self.sent_volumes = [(v, t) for v, t in self.sent_volumes if now - t < self.ECHO_WINDOW]
+            self.sent_mutes = [(m, t) for m, t in self.sent_mutes if now - t < self.ECHO_WINDOW]
+            # Our own setVolume / setMute coming back, possibly one older than the latest
+            echo = ((volume == before['volume'] or any(v == volume for v, _ in self.sent_volumes)) and
+                    (muted is None or muted == before['muted'] or any(m == muted for m, _ in self.sent_mutes)))
+            if echo:
+                return
+            with volume_lock:
+                sonos = (current_volume, is_muted)
+            target = (volume, muted if muted is not None else sonos[1])
+            if target == sonos and not self.job_queued:
+                return  # the speaker already has it
+            self.target = target
+            self.last_change = time.time()
+            self.unsettled = (target, now)
+            if self.job_queued:
+                return  # the waiting job will apply the latest target
+            self.job_queued = True
+        sonos_queue.put((self._apply_target, ()))
+
+    def _apply_target(self):
+        """Sonos queue job: set the speaker to the latest level the TV reported."""
+        with self.lock:
+            self.job_queued = False
+            target = self.target
+        if target is not None:
+            set_sonos_level(self.speaker_ip, *target)
+
+    def _log_settled(self, force=False):
+        """One log line per change, once the volume has been still for SETTLE_TIME."""
+        with self.lock:
+            if not self.unsettled or not (force or time.monotonic() - self.unsettled[1] >= self.SETTLE_TIME):
+                return
+            (volume, muted), self.unsettled = self.unsettled[0], None
+        level = f"{volume}" + (", muted" if muted else "")
+        log.info(f"LG TV volume {level} -> Sonos {level}")
+
+    def _pair(self, host, name):
+        """The owner pressed Pair: connect, and let the TV ask them to allow the bridge."""
+        settings = self.settings
+        same_tv = settings['host'] == host
+        try:
+            conn, secure = self._connect(host, settings['secure'] if same_tv else None)
+        except ConnectionRefusedError:
+            return self._pairing_failed(f"The TV at {host} refused the connection. Make sure it's on. "
+                                        + LG_HINT_CONNECT_APPS)
+        except (OSError, WebSocketError) as e:
+            return self._pairing_failed(f"Couldn't reach a TV at {host}. Make sure it's on and on the "
+                                        f"same Wi-Fi as the bridge.", detail=e)
+        try:
+            key = conn.register(settings['client_key'] if same_tv else '', allow_prompt=True,
+                                timeout=self.REGISTER_TIMEOUT, prompt_timeout=self.PAIR_TIMEOUT,
+                                on_prompt=lambda: self._set_pairing(
+                                    'prompt', "Look at your TV and choose Allow."),
+                                should_stop=lambda: self.stopping)
+            if not key:
+                raise LGPairingError('refused', "no client key")
+            self._save(host=host, name=name, client_key=key, secure=secure)
+            with self.lock:
+                self.needs_pairing = False
+                self.pair_failures = 0
+            try:
+                conn.request('ssap://system.notifications/createToast',
+                             {'message': 'Sonos Bridge connected'})
+            except OSError:
+                pass
+        except LGPairingError as e:
+            if e.reason == 'cancelled':
+                return None
+            if e.reason == 'refused':
+                return self._pairing_failed("The TV said no. Press Pair again and choose Allow on the TV.")
+            return self._pairing_failed("The TV didn't answer in time. Press Pair again, then choose "
+                                        "Allow on the TV within a minute.")
+        except (OSError, WebSocketError) as e:
+            return self._pairing_failed("The connection to the TV dropped while pairing. Press Pair "
+                                        "to try again.", detail=e)
+        finally:
+            conn.close()
+        self._set_pairing('paired', f"Paired with {name or 'the TV at ' + host}.")
+        log.info(f"LG TV: paired with {name or host} ({host})")
+        return None
+
+    def _pairing_failed(self, message, detail=None):
+        with self.lock:
+            self.pair_failures += 1
+        self._set_pairing('failed', message)
+        log.warning(f"LG TV: pairing failed: {message}" + (f" ({detail})" if detail else ""))
+
+
+def create_lg_follower(config):
+    """The LG follower, created once.  Its thread starts with the bridge (run_bridge)."""
+    global lg_follower
+    if lg_follower is None:
+        lg_follower = LGFollower(config['speaker_ip'])
+    return lg_follower
+
+
 def run_next_sonos_action():
     """Apply the next queued volume/mute change (blocks until there is one)."""
     action, args = sonos_queue.get()
@@ -1275,9 +2314,13 @@ def start_web_server():
     """Start the admin web server in a separate thread."""
     try:
         sys.path.insert(0, APP_DIR)
-        from web_server import run_server
+        import web_server
+        # This file runs as __main__, so web_server mustn't import it (that would be a
+        # second copy with its own settings): hand it what the LG TV section needs instead
+        web_server.lg_follower = lg_follower
+        web_server.config_lock = config_lock
         log.info("Starting admin web server...")
-        run_server(port=80)
+        web_server.run_server(port=80)
     except Exception as e:
         log.error(f"Web server error: {e}")
 
@@ -1347,6 +2390,8 @@ def run_bridge(config):
         Thread(target=volume_sync_loop, daemon=True).start()
         start_once(sonos_worker)
         start_once(wifi_watchdog)
+        if lg_follower:
+            lg_follower.start()  # waits quietly unless LG mode is on
 
         if cec_dev:
             bridge_phys_addr = cec_dev.physical_address()
@@ -1419,6 +2464,7 @@ def main():
             log.error("WiFi connection failed, rebooting...")
             os.system('reboot')
 
+    create_lg_follower(config)
     Thread(target=start_web_server, daemon=True).start()
     display_splash_screen()
     run_bridge(config)
