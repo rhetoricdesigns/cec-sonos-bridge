@@ -740,6 +740,7 @@ class TestFollowing(FollowerTestCase):
         self.assertFalse(follower.status()['connected'])
         self.tv.power_on()
         self.assertTrue(wait_for(lambda: follower.status()['state'] == 'connected'), follower.status())
+        self.assertTrue(wait_for(lambda: follower.status()['tv_volume'] == 30))  # synced, subscribed
         self.tv.press_volume(41)
         self.assertTrue(wait_for(lambda: self.speaker._volume == 41))
 
