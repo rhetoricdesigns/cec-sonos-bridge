@@ -224,8 +224,8 @@ LG mode is off unless you turn it on, so other TVs are unaffected.
 2. **ap_mode.py** — Creates WiFi hotspot and serves the setup wizard
 3. **cec_bridge.py** — Joins HDMI-CEC as an audio system through the kernel's CEC device (`/dev/cec0`), calls Sonos API via `soco` library. It never claims the TV input, so other devices (Fire TV, Apple TV) keep control of what's on screen, and it holds its HDMI connection so a TV waking up never sees it "switch on" (Samsung TVs switch to devices that do). Falls back to `cec-client` if `/dev/cec0` is missing.
 4. **web_server.py** — Serves the admin panel at port 80, including the CEC Activity page (`/cec`), which reads the bridge's CEC activity log (`/var/log/cec-sonos-bridge-cec.log`), and the LG TV tab
-6. **LG mode** (in `cec_bridge.py`) — Follows an LG webOS TV's own volume and mute over its local WebSocket API ("second screen", `wss://<tv>:3001` or `ws://<tv>:3000`) and sets the Sonos to match. Pairing settings are stored under `lg_tv` in `/opt/cec-sonos-bridge/config.json`. The pairing request is taken from [aiowebostv](https://github.com/home-assistant-libs/aiowebostv) (Apache 2.0).
 5. **splash_screen.py** — Generates and displays TV splash screen with QR code (the bridge turns the picture on only while the TV shows its input)
+6. **LG mode** (in `cec_bridge.py`) — Follows an LG webOS TV's own volume and mute over its local WebSocket API ("second screen", `wss://<tv>:3001` or `ws://<tv>:3000`) and sets the Sonos to match. Pairing settings are stored under `lg_tv` in `/opt/cec-sonos-bridge/config.json`. The pairing request is taken from [aiowebostv](https://github.com/home-assistant-libs/aiowebostv) (Apache 2.0).
 
 CEC Commands intercepted:
 - `05:44:41` → Volume Up
