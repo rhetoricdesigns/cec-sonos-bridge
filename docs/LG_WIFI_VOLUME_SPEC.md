@@ -450,8 +450,11 @@ push.
 - **The tab says "Sonos", not "Ray"** ("TV 23 → Sonos 23", "For your Sonos, set Sound Out
   to Optical..."), because the bridge works with any Sonos speaker. Log lines read
   `LG TV volume 23 -> Sonos 23`.
-- **The TV-speakers hint has its own wording** ("Your TV is playing sound through its own
-  speakers...") with the same fix, since "sending sound over HDMI ARC" would be wrong.
+- **The TV-speakers hint has its own wording** ("Your TV says it's playing sound through
+  its own speakers. If your Sonos isn't playing the TV's sound, set Sound Out to
+  Optical..."), since "sending sound over HDMI ARC" would be wrong. It only suggests,
+  because older TVs may name their volume scenario after the TV speakers whatever Sound
+  Out says (changed in review).
 - **The "LG Connect Apps" hint** appears after 2 failed pairings in a row, or while the
   TV refuses connections. Its menu path is hedged ("look under Settings > General, or
   Settings > Network"), because it moves between webOS versions and the TV's model is
@@ -556,6 +559,18 @@ The whole suite takes about 7 s.
   connect-time sync (the TV takes the Sonos's level).
 - **Not tried on a real LG TV.** Behaviour comes from aiowebostv and lgtv2 and is tested
   against the fake TV only.
+
+**Review (supervising session, 2026-10-01).** I read the whole diff against `main`. The
+review found no blocking problems. Checked:
+- `UPDATE_FILES` is unchanged, with no new shipped files or dependencies (standard
+  library only).
+- `web_server` doesn't import `cec_bridge`.
+- With LG mode off, the only change on the HDMI-CEC side is `tell_lg_tv()` after
+  `handle_volume`/`handle_mute`, which returns at once unless connected.
+- Config writes are atomic and keep the other keys. The version is 1.6.0 everywhere.
+- The LG tests passed 12 times in a row, with no flaky timing.
+
+Changed: the TV-speakers hint wording (see above).
 
 ## Appendix: sources
 

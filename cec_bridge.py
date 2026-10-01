@@ -1334,8 +1334,10 @@ LG_REGISTRATION_PAYLOAD = {
 
 LG_HINT_ARC = ("Your TV is sending sound over HDMI ARC. For your Sonos, set Sound Out to Optical "
                "(Settings > Sound > Sound Out).")
-LG_HINT_SPEAKERS = ("Your TV is playing sound through its own speakers. For your Sonos, set Sound Out "
-                    "to Optical (Settings > Sound > Sound Out).")
+# Older TVs may name their volume scenario after the TV speakers whatever Sound Out
+# says, so this one only suggests
+LG_HINT_SPEAKERS = ("Your TV says it's playing sound through its own speakers. If your Sonos isn't "
+                    "playing the TV's sound, set Sound Out to Optical (Settings > Sound > Sound Out).")
 LG_HINT_CONNECT_APPS = ("On the TV, turn on LG Connect Apps / TV On With Mobile (the name depends on the "
                         "TV's age: look under Settings > General, or Settings > Network).")
 
