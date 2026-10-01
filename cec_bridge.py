@@ -1830,6 +1830,7 @@ class LGFollower:
         self.lock = Lock()
         self.settings = load_lg_settings()
         self.state, self.message = 'off', "LG mode is off."
+        self.logged_message = self.message  # nothing to say while LG mode stays off
         self.tv = {'volume': None, 'muted': None, 'sound_output': None}
         self.last_change = None       # time.time() of the last change the TV reported
         self.pairing = {'state': 'idle', 'message': ''}
@@ -1866,6 +1867,12 @@ class LGFollower:
         if self.thread is not None:
             self.thread.join(timeout)
 
+    def close(self):
+        """Stop for good (tests; the bridge keeps its follower until it exits)."""
+        self.stop()
+        self.wake_reader.close()
+        self.wake_writer.close()
+
     def set_enabled(self, enabled):
         self._save(enabled=bool(enabled))
         with self.lock:
@@ -1889,7 +1896,7 @@ class LGFollower:
         if not is_valid_tv_host(host):
             raise ValueError(host)
         with self.lock:
-            self.pair_request = (host, str(name or '')[:60])
+            self.pair_request = (host, re.sub(r'[\x00-\x1f\x7f]', '', str(name or ''))[:60])
             self.pairing = {'state': 'connecting', 'message': f"Connecting to the TV at {host}..."}
             self.reconfigure = True
         self._poke()
@@ -2006,7 +2013,8 @@ class LGFollower:
                     self._set_state('unreachable', "Can't reach the TV: it's off, or not on this Wi-Fi.",
                                     detail=e)
             except Exception as e:
-                log.exception(f"LG TV: unexpected error: {e}")
+                if self.state != 'error':
+                    log.exception(f"LG TV: unexpected error: {e}")
                 self._set_state('error', f"Something went wrong: {e}")
             if self.stopping or self.reconfigure:
                 delay = self.RETRY_FIRST
@@ -2018,11 +2026,14 @@ class LGFollower:
         self._set_state('off', "Stopped.")
 
     def _set_state(self, state, message, detail=None):
+        """Show a new state on the admin panel, and log it if the message is new (so
+        retrying every minute while the TV is off doesn't fill the log)."""
         with self.lock:
-            changed = (state, message) != (self.state, self.message)
             self.state, self.message = state, message
-        if changed:
-            log.info(f"LG TV: {message}" + (f" ({detail})" if detail else ""))
+            if state == 'connecting' or message == self.logged_message:
+                return
+            self.logged_message = message
+        log.info(f"LG TV: {message}" + (f" ({detail})" if detail else ""))
 
     def _set_pairing(self, state, message):
         with self.lock:
@@ -2056,7 +2067,8 @@ class LGFollower:
     def _follow(self, settings):
         """One connection: log in, set the TV to the speaker's level, then follow the TV."""
         host = settings['host']
-        self._set_state('connecting', f"Connecting to the TV at {host}...")
+        if self.state not in ('unreachable', 'refused', 'error'):  # retrying: keep showing why
+            self._set_state('connecting', f"Connecting to the TV at {host}...")
         conn, secure = self._connect(host, settings['secure'])
         try:
             key = conn.register(settings['client_key'], allow_prompt=False,
@@ -2106,6 +2118,8 @@ class LGFollower:
         """Set the TV to the speaker's level, remembering it so its echo is recognised."""
         now = time.monotonic()
         with self.lock:
+            self.sent_volumes = [(v, t) for v, t in self.sent_volumes if now - t < self.ECHO_WINDOW]
+            self.sent_mutes = [(m, t) for m, t in self.sent_mutes if now - t < self.ECHO_WINDOW]
             send_volume = volume != self.tv['volume']
             send_mute = muted != self.tv['muted']
             if send_volume:
@@ -2259,11 +2273,24 @@ class LGFollower:
 
 
 def create_lg_follower(config):
-    """The LG follower, created once.  Its thread starts with the bridge (run_bridge)."""
+    """The LG follower, created once.  Its thread starts with the bridge (run_bridge).
+    Never raises: whatever happens here, HDMI-CEC must carry on."""
     global lg_follower
     if lg_follower is None:
-        lg_follower = LGFollower(config['speaker_ip'])
+        try:
+            lg_follower = LGFollower(config['speaker_ip'])
+        except Exception as e:
+            log.error(f"LG mode unavailable: {e}")
     return lg_follower
+
+
+def start_lg_follower():
+    """Start the LG follower's thread (it waits quietly unless LG mode is on)."""
+    try:
+        if lg_follower:
+            lg_follower.start()
+    except Exception as e:
+        log.error(f"LG mode unavailable: {e}")
 
 
 def run_next_sonos_action():
@@ -2418,8 +2445,7 @@ def run_bridge(config):
         Thread(target=volume_sync_loop, daemon=True).start()
         start_once(sonos_worker)
         start_once(wifi_watchdog)
-        if lg_follower:
-            lg_follower.start()  # waits quietly unless LG mode is on
+        start_lg_follower()
 
         if cec_dev:
             bridge_phys_addr = cec_dev.physical_address()

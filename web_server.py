@@ -466,7 +466,7 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
             display: inline-block; margin-right: 8px; vertical-align: middle;
         }
         @keyframes spin { to { transform: rotate(360deg); } }
-        .tab { padding: 12px 2px; white-space: nowrap; }
+        .tab { padding: 12px 2px; font-size: 15px; }
         input[type=text] {
             width: 100%; padding: 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.2);
             background: rgba(255,255,255,0.1); color: #fff; font-size: 16px; margin-top: 12px;

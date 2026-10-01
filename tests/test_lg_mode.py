@@ -157,7 +157,7 @@ class FollowerTestCase(ConfigTestCase):
         follower.RETRY_FIRST, follower.RETRY_MAX = 0.05, 0.2
         follower.READ_TIMEOUT = 0.05
         follower.SETTLE_TIME = 0.1
-        self.addCleanup(follower.stop)
+        self.addCleanup(follower.close)
         return follower
 
     def start_following(self, **kwargs):
@@ -785,6 +785,7 @@ class TestFollowing(FollowerTestCase):
         follower.start()
         self.assertTrue(wait_for(lambda: follower.status()['state'] == 'connected', timeout=5))
         self.assertTrue(wait_for(lambda: self.read_config()['lg_tv']['secure'] is True))
+        self.assertTrue(wait_for(lambda: follower.status()['tv_volume'] == 30))  # subscribed
         tls_tv.press_volume(19)
         self.assertTrue(wait_for(lambda: self.speaker._volume == 19))
 
@@ -809,6 +810,18 @@ class TestBackoff(FollowerTestCase):
         follower.thread.join(3)
         self.assertEqual(delays[:6], [0.01, 0.02, 0.04, 0.08, 0.08, 0.08])
 
+    def test_retries_are_logged_once(self):
+        self.tv.stop()
+        follower = self.make_follower()
+        follower.RETRY_FIRST = follower.RETRY_MAX = 0.01
+        with mock.patch.object(cec_bridge, 'log') as log:
+            follower.start()
+            self.assertTrue(wait_for(lambda: follower.status()['state'] == 'refused'))
+            time.sleep(0.3)  # many retries
+            follower.stop()
+        lines = [str(c) for c in log.info.call_args_list]
+        self.assertEqual(len(lines), 2, lines)  # refused, then stopped
+
     def test_retry_delay_resets_after_a_connection(self):
         follower = self.start_following()
         delays = []
@@ -830,7 +843,7 @@ class TestLGModeOff(FollowerTestCase):
 
     def test_off_by_default_does_nothing(self):
         follower = cec_bridge.LGFollower(SPEAKER_IP, ports={True: self.tv.port, False: self.tv.port})
-        self.addCleanup(follower.stop)
+        self.addCleanup(follower.close)
         self.assertFalse(follower.settings['enabled'])
         follower.start()
         self.assertTrue(wait_for(lambda: follower.status()['state'] == 'off'))
@@ -839,6 +852,24 @@ class TestLGModeOff(FollowerTestCase):
         self.assertEqual(self.jobs_run, 0)
         self.assertEqual(self.speaker.reads + len(self.speaker.volume_sets), 0)
         self.assertNotIn('lg_tv', self.read_config())  # nothing written either
+
+    def test_logs_nothing(self):
+        with mock.patch.object(cec_bridge, 'log') as log:
+            follower = cec_bridge.LGFollower(SPEAKER_IP)
+            self.addCleanup(follower.close)
+            follower.start()
+            time.sleep(0.1)
+        self.assertEqual(log.mock_calls, [])
+
+    def test_startup_never_fails_because_of_lg_mode(self):
+        with mock.patch.object(cec_bridge, 'lg_follower', None), \
+                mock.patch.object(cec_bridge, 'LGFollower', side_effect=OSError('no sockets')):
+            self.assertIsNone(cec_bridge.create_lg_follower({'speaker_ip': SPEAKER_IP}))
+            cec_bridge.start_lg_follower()  # nothing to start, and no error
+        broken = mock.Mock()
+        broken.start.side_effect = RuntimeError("can't start new thread")
+        with mock.patch.object(cec_bridge, 'lg_follower', broken):
+            cec_bridge.start_lg_follower()
 
     def test_turning_it_on_connects(self):
         follower = self.make_follower(enabled=False)
@@ -952,6 +983,7 @@ class TestWebEndpoints(ConfigTestCase):
 
     def test_real_follower_status_and_enable(self):
         follower = cec_bridge.LGFollower(SPEAKER_IP)  # thread not started: just the settings
+        self.addCleanup(follower.close)
         with mock.patch.object(web_server, 'lg_follower', follower):
             data = self.call('GET', '/api/lg/status')[1]
             self.assertEqual((data['available'], data['enabled'], data['paired'], data['hints']),
