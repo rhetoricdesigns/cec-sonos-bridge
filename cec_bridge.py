@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
 """
-CEC-Sonos Bridge v1.5.4
+CEC-Sonos Bridge v1.6.0
 Monitors HDMI-CEC for TV remote volume commands and controls Sonos speaker.
 Also runs a web server for admin access at http://sonosbridge.local
 
 Talks to the kernel's CEC device (/dev/cec0) directly, as a pure Audio System.
 Falls back to cec-client when /dev/cec0 is missing (legacy firmware CEC).
+
+Key improvements over v1.5.4:
+  - LG mode (admin panel: LG TV tab; off by default).  An LG TV gives its
+    remote's volume keys over HDMI-CEC only to a sound device on its ARC port,
+    and a speaker on the TV's optical output would go silent there.  So with
+    LG mode on, the bridge follows the LG TV's own volume and mute over Wi-Fi,
+    through the TV's network API (webOS "second screen", a WebSocket on port
+    3001 or 3000), and sets the Sonos to the same number.  When the bridge
+    connects, the TV takes the Sonos's level, so the Sonos never jumps; HDMI-CEC
+    volume keys that reach the bridge are passed on to the TV the same way.
+    With LG mode off, nothing changes.
 
 Key improvements over v1.5.3:
   - Hands the screen back.  The TV still switched to the bridge's input about
@@ -105,7 +116,10 @@ CEC Opcodes handled:
 
 Hardware: Raspberry Pi Zero 2 W
   Samsung: use any non-ARC HDMI port
-  LG:      use the ARC-labelled HDMI port (usually HDMI 2)
+  LG:      use any non-ARC HDMI port, with the TV's Sound Out on Optical (or
+           whatever the speaker uses), and turn on LG mode in the admin panel.
+           Not the ARC port: the LG would send its sound there, and a speaker on
+           optical would go silent.
 """
 
 import subprocess
@@ -2360,10 +2374,10 @@ def run_bridge(config):
     hdmi_port = config.get('hdmi_port', '2')
 
     open_traffic_log()
-    traffic_log.info("--- Sonos Bridge v1.5.4 starting ---")
+    traffic_log.info("--- Sonos Bridge v1.6.0 starting ---")
 
     log.info("=" * 50)
-    log.info("CEC-Sonos Bridge v1.5.4 Active")
+    log.info("CEC-Sonos Bridge v1.6.0 Active")
     log.info(f"Speaker: {speaker_name} ({speaker_ip})")
     log.info(f"HDMI Port: {hdmi_port}")
     log.info(f"Admin: http://sonosbridge.local")
@@ -2460,7 +2474,7 @@ def install_signal_handlers():
 
 def main():
     """Main entry point."""
-    log.info("CEC-Sonos Bridge v1.5.4 starting...")
+    log.info("CEC-Sonos Bridge v1.6.0 starting...")
 
     config = load_config()
     if not config:

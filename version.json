@@ -1,5 +1,5 @@
 {
-  "version": "1.5.4",
-  "updated": "2026-09-30",
-  "changelog": "The splash screen now shows only when you switch the TV to the bridge's input. And if the TV is sent to the bridge shortly after another device (like a Fire TV) takes the screen, the bridge hands the screen straight back to that device. A Fire TV remote does that when the Fire TV has the wrong HDMI input saved (Settings > Equipment Control > Manage Equipment)."
+  "version": "1.6.0",
+  "updated": "2026-10-01",
+  "changelog": "New: LG mode, for LG TVs. The bridge follows the LG TV's own volume over Wi-Fi and sets your Sonos to the same number, so the LG remote (and an Apple TV remote set to control the TV by IR) changes your Sonos even though it's connected to the TV by optical cable. Turn it on in the admin panel: LG TV tab > Find my TV > Pair with TV (choose Allow on the TV) > Follow LG TV volume. It's off unless you turn it on, so nothing changes on other TVs. Also includes everything from v1.5.4: the splash screen only shows when you switch the TV to the bridge's input, and the bridge hands the screen straight back if a Fire TV remote sends the TV to it by mistake."
 }

@@ -108,6 +108,7 @@ Features:
 - Check for updates
 - Rollback to previous versions
 - Factory reset
+- LG TV tab: LG mode, for LG TVs (see [LG TVs](#lg-tvs) below)
 
 ---
 
@@ -174,7 +175,7 @@ Works with any TV that supports HDMI-CEC:
 | Brand | CEC Name |
 |-------|----------|
 | Samsung | Anynet+ |
-| LG | SimpLink |
+| LG | SimpLink (use [LG mode](#lg-tvs)) |
 | Sony | BRAVIA Sync |
 | Vizio | CEC |
 | TCL/Roku | CEC |
@@ -183,12 +184,47 @@ Works with any TV that supports HDMI-CEC:
 
 ---
 
+## LG TVs
+
+An LG TV only sends its remote's volume buttons over HDMI to a sound system on its ARC port, and a Sonos connected to the TV by optical cable would go silent if the bridge were there. So for LG TVs the bridge uses **LG mode**: it follows the TV's own volume over Wi-Fi and sets your Sonos to the same number. Nothing depends on infrared reaching the Sonos.
+
+### Setting it up
+
+1. Plug the bridge into a **non-ARC** HDMI port on the TV (any port not labelled ARC or eARC).
+2. On the LG TV, set **Settings → Sound → Sound Out** to **Optical** (or whatever cable your Sonos uses).
+3. If you ever set up the Sonos as a soundbar on the TV (under **Device Connector** or **Universal Control**), remove it there.
+4. Open the admin panel (**http://sonosbridge.local**) and tap the **LG TV** tab.
+5. Tap **Find my TV**. Your TV should appear in the list; tap it. (If it doesn't, type the TV's IP address in the box. You'll find it on the TV under **Settings → Network → Wi-Fi Connection → Advanced Wi-Fi Settings**, or **Wired Connection**.)
+6. Tap **Pair with TV**, then look at the TV and choose **Allow**.
+7. Turn on **Follow LG TV volume**.
+8. Press volume on the LG remote. The LG TV tab shows something like **TV 23 → Sonos 23**, and your Sonos changes.
+
+### Apple TV
+
+On the Apple TV, go to **Settings → Remotes and Devices → Volume Control** and choose **TV via IR**. The Apple TV remote then changes the TV's volume, and the bridge follows the TV.
+
+### If it doesn't work
+
+The LG TV tab shows whether the bridge is connected to the TV, the volume on both, the TV's Sound Out, and a hint when something needs changing:
+
+- **"Your TV is sending sound over HDMI ARC..."** or **"...playing sound through its own speakers..."** — set **Settings → Sound → Sound Out** to **Optical**.
+- **"The TV refused the connection"**, or pairing keeps failing — on the TV, turn on **LG Connect Apps** (newer TVs call it **TV On With Mobile**; look under **Settings → General** or **Settings → Network**).
+- **"Can't reach the TV"** — the TV is off, or not on the same Wi-Fi as the bridge. The bridge keeps trying, and reconnects by itself when the TV comes back on.
+- **"The TV has forgotten the bridge"** — tap **Pair with TV** again and choose **Allow** on the TV.
+
+If the TV's IP address changes (after a router restart, say), tap **Find my TV** and **Pair with TV** again. Giving the TV a fixed IP address in your router's settings avoids this.
+
+LG mode is off unless you turn it on, so other TVs are unaffected.
+
+---
+
 ## How It Works (Technical)
 
 1. **startup.py** — Runs at boot, decides whether to enter AP mode or bridge mode
 2. **ap_mode.py** — Creates WiFi hotspot and serves the setup wizard
 3. **cec_bridge.py** — Joins HDMI-CEC as an audio system through the kernel's CEC device (`/dev/cec0`), calls Sonos API via `soco` library. It never claims the TV input, so other devices (Fire TV, Apple TV) keep control of what's on screen, and it holds its HDMI connection so a TV waking up never sees it "switch on" (Samsung TVs switch to devices that do). Falls back to `cec-client` if `/dev/cec0` is missing.
-4. **web_server.py** — Serves the admin panel at port 80, including the CEC Activity page (`/cec`), which reads the bridge's CEC activity log (`/var/log/cec-sonos-bridge-cec.log`)
+4. **web_server.py** — Serves the admin panel at port 80, including the CEC Activity page (`/cec`), which reads the bridge's CEC activity log (`/var/log/cec-sonos-bridge-cec.log`), and the LG TV tab
+6. **LG mode** (in `cec_bridge.py`) — Follows an LG webOS TV's own volume and mute over its local WebSocket API ("second screen", `wss://<tv>:3001` or `ws://<tv>:3000`) and sets the Sonos to match. Pairing settings are stored under `lg_tv` in `/opt/cec-sonos-bridge/config.json`. The pairing request is taken from [aiowebostv](https://github.com/home-assistant-libs/aiowebostv) (Apache 2.0).
 5. **splash_screen.py** — Generates and displays TV splash screen with QR code (the bridge turns the picture on only while the TV shows its input)
 
 CEC Commands intercepted:
