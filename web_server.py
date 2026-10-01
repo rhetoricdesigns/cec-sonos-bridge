@@ -24,7 +24,7 @@ import subprocess
 import logging
 import shutil
 import urllib.request
-from threading import Thread
+from threading import Thread, Lock
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 from datetime import datetime
@@ -62,6 +62,12 @@ WEB_PORT = 80
 
 # Current mode - set by whoever starts this server
 CURRENT_MODE = 'bridge'  # 'ap' or 'bridge'
+
+# LG mode.  cec_bridge.py runs as __main__, so importing it here would load a second
+# copy with its own settings: it hands over its LG follower and its config lock instead.
+lg_follower = None
+config_lock = Lock()
+LG_UNAVAILABLE = "LG mode isn't available right now: the bridge isn't running."
 
 
 # ============================================================
@@ -250,9 +256,17 @@ def get_config():
 
 
 def save_config(config):
+    """Write config.json atomically, keeping the LG TV settings as they are on disk
+    (the LG follower may have saved a pairing since this config was read)."""
     os.makedirs(APP_DIR, exist_ok=True)
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=2)
+    with config_lock:
+        current = get_config()
+        if 'lg_tv' in current:
+            config = dict(config, lg_tv=current['lg_tv'])
+        tmp = CONFIG_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(config, f, indent=2)
+        os.replace(tmp, CONFIG_FILE)
 
 
 def get_service_status():
@@ -452,6 +466,28 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
             display: inline-block; margin-right: 8px; vertical-align: middle;
         }
         @keyframes spin { to { transform: rotate(360deg); } }
+        .tab { padding: 12px 2px; white-space: nowrap; }
+        input[type=text] {
+            width: 100%; padding: 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.2);
+            background: rgba(255,255,255,0.1); color: #fff; font-size: 16px; margin-top: 12px;
+        }
+        #lgtv .status-row { align-items: center; gap: 12px; }
+        #lgtv .status-value { text-align: right; }
+        .lg-note { font-size: 13px; color: rgba(255,255,255,0.7); margin-top: 16px; line-height: 1.4; }
+        .lg-hint { margin: 12px 0 0; }
+        .switch { position: relative; display: inline-block; width: 52px; height: 30px; flex-shrink: 0; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider {
+            position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(255,255,255,0.25); border-radius: 30px; transition: 0.2s;
+        }
+        .slider:before {
+            position: absolute; content: ""; height: 24px; width: 24px; left: 3px; bottom: 3px;
+            background: #fff; border-radius: 50%; transition: 0.2s;
+        }
+        .switch input:checked + .slider { background: #00d4aa; }
+        .switch input:checked + .slider:before { transform: translateX(22px); }
+        .switch input:disabled + .slider { opacity: 0.5; }
     </style>
 </head>
 <body>
@@ -505,6 +541,7 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
                 <div class="tab active" id="tabUpdates">Updates</div>
                 <div class="tab" id="tabRollback">Rollback</div>
                 <div class="tab" id="tabSettings">Settings</div>
+                <div class="tab" id="tabLg">LG TV</div>
             </div>
 
             <div id="updates" class="tab-content active">
@@ -561,6 +598,58 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
                 </div>
                 <button type="button" class="btn-danger" id="resetBtn">Factory Reset</button>
             </div>
+
+            <div id="lgtv" class="tab-content">
+                <div id="lgUnavailable" class="alert alert-info hidden"></div>
+                <div id="lgMain">
+                    <p class="lg-note" style="margin-top:0">For LG TVs: the bridge follows the TV's own volume over Wi-Fi and sets your Sonos to the same number.</p>
+                    <div class="status-row">
+                        <span class="status-label">Follow LG TV volume</span>
+                        <label class="switch"><input type="checkbox" id="lgEnabled"><span class="slider"></span></label>
+                    </div>
+                    <div class="status-row">
+                        <span class="status-label">TV</span>
+                        <span class="status-value" id="lgTv">-</span>
+                    </div>
+                    <div class="status-row">
+                        <span class="status-label">Connection</span>
+                        <span class="status-value" id="lgConnection">-</span>
+                    </div>
+                    <div class="status-row">
+                        <span class="status-label">Volume</span>
+                        <span class="status-value" id="lgVolume">-</span>
+                    </div>
+                    <div class="status-row">
+                        <span class="status-label">TV Sound Out</span>
+                        <span class="status-value" id="lgOutput">-</span>
+                    </div>
+                    <div class="status-row">
+                        <span class="status-label">Last change</span>
+                        <span class="status-value" id="lgLastChange">-</span>
+                    </div>
+                    <div id="lgHints"></div>
+                    <div id="lgPairStatus" class="alert hidden lg-hint"></div>
+
+                    <button type="button" class="btn-secondary" id="lgFindBtn">Find my TV</button>
+                    <div id="lgFound" style="margin-top:12px"></div>
+                    <input type="text" id="lgHost" placeholder="Or type the TV's IP address" autocomplete="off" autocapitalize="off" spellcheck="false">
+                    <button type="button" class="btn-primary" id="lgPairBtn">Pair with TV</button>
+
+                    <div id="lgForgetConfirm" class="hidden">
+                        <div class="confirm-box" style="border-color: #dc3545;">
+                            <p>Forget this TV? You'll need to pair again to use LG mode.</p>
+                            <div class="confirm-buttons">
+                                <button type="button" class="btn-danger btn-small" id="lgForgetYes">Yes, Forget</button>
+                                <button type="button" class="btn-secondary btn-small" id="lgForgetNo">Cancel</button>
+                            </div>
+                        </div>
+                    </div>
+                    <button type="button" class="btn-secondary" id="lgForgetBtn">Forget TV</button>
+
+                    <p class="lg-note"><strong>Apple TV tip:</strong> on the Apple TV, go to Settings &gt; Remotes and Devices &gt; Volume Control and choose <strong>TV via IR</strong>. The Apple TV remote then changes the TV's volume, and the bridge follows it.</p>
+                    <p class="lg-note"><strong>On the LG TV:</strong> set Settings &gt; Sound &gt; Sound Out to <strong>Optical</strong> (or whatever cable your Sonos uses).</p>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -572,6 +661,8 @@ function showTab(name) {
     for (var i = 0; i < tabs.length; i++) { tabs[i].classList.remove("active"); }
     for (var i = 0; i < contents.length; i++) { contents[i].classList.remove("active"); }
     document.getElementById(name).classList.add("active");
+    lgVisible = (name === "lgtv");
+    lgStartPolling();
 }
 
 document.getElementById("tabUpdates").addEventListener("click", function() {
@@ -584,6 +675,10 @@ document.getElementById("tabRollback").addEventListener("click", function() {
 });
 document.getElementById("tabSettings").addEventListener("click", function() {
     showTab("settings");
+    this.classList.add("active");
+});
+document.getElementById("tabLg").addEventListener("click", function() {
+    showTab("lgtv");
     this.classList.add("active");
 });
 
@@ -827,6 +922,214 @@ document.getElementById("resetYes").addEventListener("click", function() {
         });
 });
 
+// ---- LG TV ----
+var lgVisible = false;
+var lgTimer = null;
+var lgToggleBusy = false;
+var lgSelected = null;  // {host, name} chosen from Find my TV
+
+function lgPost(path, body) {
+    return fetch(path, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body || {})
+    }).then(function(r) { return r.json(); });
+}
+
+function lgStartPolling() {
+    if (lgVisible && !document.hidden && lgTimer === null) { lgPoll(); }
+}
+
+function lgPoll() {
+    lgTimer = null;
+    if (!lgVisible || document.hidden) { return; }
+    fetch("/api/lg/status")
+        .then(function(r) { return r.json(); })
+        .then(function(data) { lgShow(data); })
+        .catch(function(e) {})
+        .then(function() {
+            if (lgTimer === null && lgVisible && !document.hidden) { lgTimer = setTimeout(lgPoll, 1000); }
+        });
+}
+
+document.addEventListener("visibilitychange", lgStartPolling);
+
+function lgMuted(muted) { return muted ? " (muted)" : ""; }
+
+function lgAgo(seconds) {
+    if (seconds === null || seconds === undefined) { return "-"; }
+    if (seconds < 60) { return seconds + " s ago"; }
+    if (seconds < 3600) { return Math.floor(seconds / 60) + " min ago"; }
+    return Math.floor(seconds / 3600) + " h ago";
+}
+
+function lgShow(data) {
+    var unavailable = document.getElementById("lgUnavailable");
+    if (!data.available) {
+        unavailable.textContent = data.message || "LG mode isn't available right now.";
+        unavailable.classList.remove("hidden");
+        document.getElementById("lgMain").classList.add("hidden");
+        return;
+    }
+    unavailable.classList.add("hidden");
+    document.getElementById("lgMain").classList.remove("hidden");
+
+    if (!lgToggleBusy) { document.getElementById("lgEnabled").checked = data.enabled; }
+    document.getElementById("lgTv").textContent = data.paired ? (data.name ? data.name + " (" + data.host + ")" : data.host) : "Not paired";
+    var conn = document.getElementById("lgConnection");
+    conn.textContent = data.message || "-";
+    conn.className = "status-value " + (data.connected ? "status-active" : (data.enabled ? "status-inactive" : ""));
+
+    var volume = "-";
+    if (data.connected) {
+        if (data.tv_volume === -1) {
+            volume = "TV isn't reporting a volume";
+        } else if (data.tv_volume !== null) {
+            volume = "TV " + data.tv_volume + lgMuted(data.tv_muted) + " \u2192 Sonos " + data.sonos_volume + lgMuted(data.sonos_muted);
+        }
+    }
+    document.getElementById("lgVolume").textContent = volume;
+    document.getElementById("lgOutput").textContent = data.sound_output || "-";
+    document.getElementById("lgLastChange").textContent = lgAgo(data.last_change_ago);
+
+    var hints = document.getElementById("lgHints");
+    hints.innerHTML = "";
+    for (var i = 0; i < data.hints.length; i++) {
+        var hint = document.createElement("div");
+        hint.className = "alert alert-error lg-hint";
+        hint.textContent = data.hints[i];
+        hints.appendChild(hint);
+    }
+
+    var pair = document.getElementById("lgPairStatus");
+    var p = data.pairing || {};
+    if (p.state && p.state !== "idle") {
+        pair.className = "alert lg-hint " + (p.state === "paired" ? "alert-success" : p.state === "failed" ? "alert-error" : "alert-info");
+        pair.textContent = p.message;
+        var busy = (p.state === "connecting" || p.state === "prompt");
+        document.getElementById("lgPairBtn").disabled = busy;
+    } else {
+        pair.className = "alert hidden lg-hint";
+        document.getElementById("lgPairBtn").disabled = false;
+    }
+    document.getElementById("lgForgetBtn").classList.toggle("hidden", !data.paired || !document.getElementById("lgForgetConfirm").classList.contains("hidden"));
+}
+
+document.getElementById("lgEnabled").addEventListener("change", function() {
+    var box = this;
+    lgToggleBusy = true;
+    box.disabled = true;
+    lgPost("/api/lg/enable", {enabled: box.checked})
+        .then(function(data) {
+            if (!data.success) {
+                showAlert(data.message || "Could not change the setting", "error");
+                box.checked = !box.checked;
+            }
+        })
+        .catch(function(e) {
+            showAlert("Could not change the setting. Check connection.", "error");
+            box.checked = !box.checked;
+        })
+        .then(function() { lgToggleBusy = false; box.disabled = false; });
+});
+
+document.getElementById("lgFindBtn").addEventListener("click", function() {
+    var btn = this;
+    var list = document.getElementById("lgFound");
+    btn.disabled = true;
+    list.innerHTML = '<span class="spinner"></span> Looking for LG TVs...';
+    lgPost("/api/lg/find")
+        .then(function(data) {
+            list.innerHTML = "";
+            var tvs = data.tvs || [];
+            if (!data.success || tvs.length === 0) {
+                var none = document.createElement("div");
+                none.className = "alert alert-error";
+                none.textContent = data.message || "No LG TV found. Make sure the TV is on and on the same Wi-Fi as the bridge, or type its IP address below (on the TV: Settings > Network > Wi-Fi Connection > Advanced Wi-Fi Settings).";
+                list.appendChild(none);
+                return;
+            }
+            for (var i = 0; i < tvs.length; i++) {
+                var item = document.createElement("div");
+                item.className = "version-item";
+                var name = document.createElement("div");
+                name.className = "version-name";
+                name.textContent = tvs[i].name || "LG TV";
+                var ip = document.createElement("div");
+                ip.className = "version-date";
+                ip.textContent = tvs[i].host;
+                item.appendChild(name);
+                item.appendChild(ip);
+                item.setAttribute("data-index", i);
+                item.addEventListener("click", function() {
+                    var items = document.querySelectorAll("#lgFound .version-item");
+                    for (var k = 0; k < items.length; k++) { items[k].classList.remove("current"); }
+                    this.classList.add("current");
+                    lgSelected = tvs[parseInt(this.getAttribute("data-index"))];
+                    document.getElementById("lgHost").value = lgSelected.host;
+                });
+                list.appendChild(item);
+            }
+            if (tvs.length === 1) { list.firstChild.click(); }
+        })
+        .catch(function(e) {
+            list.innerHTML = "";
+            showAlert("Search failed. Check connection.", "error");
+        })
+        .then(function() { btn.disabled = false; });
+});
+
+document.getElementById("lgHost").addEventListener("input", function() {
+    if (lgSelected && this.value.trim() !== lgSelected.host) {
+        lgSelected = null;
+        var items = document.querySelectorAll("#lgFound .version-item");
+        for (var k = 0; k < items.length; k++) { items[k].classList.remove("current"); }
+    }
+});
+
+document.getElementById("lgPairBtn").addEventListener("click", function() {
+    var host = document.getElementById("lgHost").value.trim();
+    if (!host) {
+        showAlert("Press Find my TV first, or type the TV's IP address", "error");
+        return;
+    }
+    var btn = this;
+    btn.disabled = true;
+    lgPost("/api/lg/pair", {host: host, name: lgSelected ? lgSelected.name : ""})
+        .then(function(data) {
+            if (!data.success) {
+                showAlert(data.message || "Pairing failed", "error");
+                btn.disabled = false;
+            }
+            lgStartPolling();
+        })
+        .catch(function(e) {
+            showAlert("Pairing failed. Check connection.", "error");
+            btn.disabled = false;
+        });
+});
+
+document.getElementById("lgForgetBtn").addEventListener("click", function() {
+    document.getElementById("lgForgetConfirm").classList.remove("hidden");
+    this.classList.add("hidden");
+});
+
+document.getElementById("lgForgetNo").addEventListener("click", function() {
+    document.getElementById("lgForgetConfirm").classList.add("hidden");
+    document.getElementById("lgForgetBtn").classList.remove("hidden");
+});
+
+document.getElementById("lgForgetYes").addEventListener("click", function() {
+    document.getElementById("lgForgetConfirm").classList.add("hidden");
+    lgPost("/api/lg/forget")
+        .then(function(data) {
+            showAlert(data.success ? "TV forgotten" : (data.message || "Could not forget the TV"), data.success ? "success" : "error");
+        })
+        .catch(function(e) {
+            showAlert("Could not forget the TV. Check connection.", "error");
+        });
+});
+
 // ---- Page load ----
 loadStatus();
 loadBackups();
@@ -1023,6 +1326,8 @@ loadSpeakers();
 
 class WebHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
+        if '/api/lg/status' in str(args[0]):
+            return  # polled every second while the LG TV tab is open
         log.info(f"HTTP: {args[0]}")
 
     def send_html(self, html, status=200):
@@ -1114,6 +1419,13 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_json(get_backups())
             return
 
+        if path == '/api/lg/status':
+            if lg_follower is None:
+                self.send_json({'available': False, 'message': LG_UNAVAILABLE})
+            else:
+                self.send_json(dict(lg_follower.status(), available=True))
+            return
+
         if path == '/api/logs':
             try:
                 with open(LOG_FILE, 'r') as f:
@@ -1202,6 +1514,10 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_json({'success': True})
             return
 
+        if path.startswith('/api/lg/'):
+            self.handle_lg_post(path, data)
+            return
+
         if path == '/api/admin/factory-reset':
             try:
                 os.remove(CONFIG_FILE)
@@ -1213,6 +1529,38 @@ class WebHandler(BaseHTTPRequestHandler):
 
         self.send_response(404)
         self.end_headers()
+
+    def handle_lg_post(self, path, data):
+        """The LG TV section's buttons."""
+        if path not in ('/api/lg/find', '/api/lg/pair', '/api/lg/enable', '/api/lg/forget'):
+            self.send_response(404)
+            self.end_headers()
+            return
+        if lg_follower is None:
+            self.send_json({'success': False, 'message': LG_UNAVAILABLE})
+            return
+        try:
+            if path == '/api/lg/find':
+                tvs = lg_follower.find_tvs()
+                self.send_json({'success': True, 'tvs': [{'host': tv['host'], 'name': tv['name']}
+                                                         for tv in tvs]})
+            elif path == '/api/lg/pair':
+                try:
+                    lg_follower.request_pairing(str(data.get('host') or ''), str(data.get('name') or ''))
+                except ValueError:
+                    self.send_json({'success': False, 'message': "That doesn't look like an IP address. "
+                                    "It should look like 192.168.1.40."})
+                    return
+                self.send_json({'success': True})
+            elif path == '/api/lg/enable':
+                lg_follower.set_enabled(bool(data.get('enabled')))
+                self.send_json({'success': True})
+            else:
+                lg_follower.forget()
+                self.send_json({'success': True})
+        except Exception as e:
+            log.error(f"LG TV: {path} failed: {e}")
+            self.send_json({'success': False, 'message': f"That didn't work: {e}"})
 
 
 def run_server(port=WEB_PORT):
