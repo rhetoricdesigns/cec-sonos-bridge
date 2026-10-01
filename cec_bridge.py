@@ -2082,7 +2082,7 @@ class LGFollower:
                 self.outbox = None
                 self.skip_first_report = False
             self.was_connected = True
-            self._set_state('connected', f"Connected to {settings['name'] or 'the TV at ' + host}.")
+            self._set_state('connected', "Connected.", detail=settings['name'] or host)
             self._sync_tv_to_speaker(conn)
             conn.subscribe_volume()
             self._read_loop(conn)
