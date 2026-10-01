@@ -1983,7 +1983,7 @@ class LGFollower:
                 self.changed.wait()
                 continue
             if not settings['host'] or not settings['client_key'] or needs_pairing:
-                if self.state not in ('not_paired', 'pair_refused'):
+                if not needs_pairing:  # otherwise the state already says why
                     self._set_state('not_paired', "Not paired with a TV yet: press Find my TV, then Pair.")
                 self.changed.wait()
                 continue

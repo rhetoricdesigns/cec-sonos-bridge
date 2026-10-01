@@ -434,7 +434,128 @@ push.
 
 ## 12. Decisions made during the build
 
-(The building session fills this in.)
+**Admin panel**
+
+- **A new "LG TV" tab**, next to Updates / Rollback / Settings, rather than a card. Status
+  is polled once a second only while that tab is open and the page is visible. To fit four
+  tabs at phone width, the tabs' side padding went from 12px to 2px and their text from
+  16px to 15px (checked in Chromium at 320px and 375px: no sideways scrolling).
+- **The status poll isn't logged.** `WebHandler.log_message` skips `/api/lg/status`,
+  which would otherwise add a line a second to the main log.
+- **Pairing doesn't block the web server**, which handles one request at a time.
+  `POST /api/lg/pair` only starts it. The follower thread does the pairing, and the tab
+  shows its progress from `status()['pairing']` ("Look at your TV and choose Allow.",
+  "Paired with ...", or the reason it failed). "Find my TV" does block it for about 3 s,
+  plus up to 2 s per TV to read its name.
+- **The tab says "Sonos", not "Ray"** ("TV 23 → Sonos 23", "For your Sonos, set Sound Out
+  to Optical..."), because the bridge works with any Sonos speaker. Log lines read
+  `LG TV volume 23 -> Sonos 23`.
+- **The TV-speakers hint has its own wording** ("Your TV is playing sound through its own
+  speakers...") with the same fix, since "sending sound over HDMI ARC" would be wrong.
+- **The "LG Connect Apps" hint** appears after 2 failed pairings in a row, or while the
+  TV refuses connections. Its menu path is hedged ("look under Settings > General, or
+  Settings > Network"), because it moves between webOS versions and the TV's model is
+  unknown.
+- **"Pair with TV" and "Follow LG TV volume" are separate**, as in the spec's test plan:
+  pairing doesn't turn following on.
+- **"Forget TV" clears host, name, client key and the remembered wss/ws choice**, and
+  leaves the "Follow" switch as it was. With no TV it just waits.
+- **TV names from discovery and the manual IP** go into the page with `textContent`
+  only. The IP must look like an IP address or host name (`is_valid_tv_host`), and the
+  name has control characters removed and is cut to 60 characters.
+
+**Following the TV**
+
+- **Exact-level setter:** one function, `set_sonos_level(speaker_ip, volume, muted)`. It
+  only sets what differs from our copy of the speaker's level (`current_volume` /
+  `is_muted`), then updates them under `volume_lock` and calls `report_audio_status()`.
+  It compares against our copy instead of asking the speaker, to save a network round
+  trip on every step.
+- **Echoes:** besides "the speaker already has it", a report counts as our own echo when
+  each field either didn't change or matches a level we sent the TV in the last 2 s.
+  This stops a stale echo pulling the speaker back: CEC up, up quickly sends the TV
+  32 and 34, and the TV's late "32" must not set the speaker to 32. A matched echo is
+  forgotten once seen, so a real unmute right after connecting is still followed.
+- **Connect-time sync goes through the Sonos queue.** A job reads the speaker
+  (`read_sonos_level`), and the follower waits up to 5 s for it, then sends `setVolume` /
+  `setMute`, then subscribes. If the speaker can't be read, the TV keeps its own level
+  and the bridge just follows it. The first volume report after a sync is ignored,
+  because it can still carry the TV's old level. The TV reports again once it has
+  taken the new one.
+- **If the TV doesn't say whether it's muted,** the speaker's mute is left alone.
+- **TV volumes above 100 are capped at 100.** -1 or a missing volume leaves the speaker
+  alone. -1 shows the ARC hint, as does a sound output containing "arc". Sound output
+  is read from `volumeStatus.soundOutput`, else `soundOutput`, else `scenario`.
+- **Logging:** one `LG TV volume N -> Sonos N` line once the volume has been still for
+  1 s. Connection states are logged only when the message is new, so a TV that's off
+  overnight costs two lines ("Lost the TV", "Can't reach the TV"), not one a minute.
+  "Connecting..." is never logged. With LG mode off, the follower logs nothing at all.
+
+**Connection**
+
+- **Order:** wss://3001 first, then ws://3000, or the one that worked last time first
+  (saved as `secure`). When both fail, the reported error prefers the one that isn't
+  "connection refused", since most TVs only open one of the two ports.
+- **No "hello" or `getSystemInfo` before registering** (aiowebostv sends them; lgtv2
+  doesn't). Only the registration from aiowebostv's `handshake.py` is sent.
+- **The TV asks for pairing while nobody pressed Pair** (it forgot the key): the bridge
+  closes the connection, shows "The TV has forgotten the bridge. Press Pair...", and
+  stops trying until Pair is pressed, the TV is forgotten, or Follow is turned off and on
+  again. Turning Follow on allows one more try with the saved key, so the TV asks at most
+  once per press of the switch.
+- **A registration that times out** (10 s with no answer) counts as "TV not answering":
+  the bridge retries with backoff and doesn't ask for pairing.
+- **Waking up:** the follower waits on an `Event` while idle. While connected, it
+  `select()`s on the TV socket and a socket pair that's poked on stop, on settings
+  changes and on CEC changes to send. So stop and settings changes take effect at
+  once, without busy loops. The read loop also looks up every second for pings and for
+  logging settled changes.
+- **Only the follower thread writes to the TV socket.** The CEC hook
+  (`tell_lg_tv` → `speaker_changed`) puts the level in a one-slot outbox and pokes the
+  thread. Python's `ssl` sockets aren't safe for a read in one thread and a write in
+  another.
+- **Thread start:** the follower object is created in `main()` before the web server
+  thread, so `web_server.lg_follower` can be set before `run_server()`. Its thread starts
+  in `run_bridge()` after the Sonos worker. It needs the worker for the connect-time sync
+  and doesn't delay CEC. Creating it and starting it can't raise
+  (`create_lg_follower` / `start_lg_follower` catch everything), so LG mode can never
+  stop the bridge starting.
+- **Config lock:** `cec_bridge.start_web_server()` hands `web_server` both
+  `lg_follower` and `config_lock`. `web_server.save_config()` takes the lock, re-reads
+  the file, keeps its `lg_tv` as it is on disk, and writes atomically (temp file and
+  `os.replace`). `save_lg_settings()` takes the same lock, re-reads, changes only `lg_tv`
+  and writes atomically with `fsync`. It refuses to overwrite a `config.json` it can't
+  parse.
+
+**Licence:** aiowebostv is Apache 2.0, and copying its registration manifest into an
+MIT project is fine as long as attribution is kept. The comment above
+`LG_REGISTRATION_PAYLOAD` gives the source URL at commit
+`f52c91bfe6c8ff1cd2639f59db8aa408320abe69`, the licence and the copyright holders. The
+README credits it too. The current manifest has no `signed` block (older lgtv2-style
+manifests did). It was copied as it is.
+
+**Tests:** `tests/fake_lg_tv.py` is a real WebSocket and SSAP server on 127.0.0.1 (TLS
+optional, with a certificate made by the `openssl` command, skipped without it). It
+checks that client frames are masked. `tests/test_lg_mode.py` has 89 tests. The follower
+tests run a real follower thread against the fake TV and a fake `soco` module. Timeouts
+are class attributes that the tests shrink (retry 0.05 s, read loop 0.05 s, and so on).
+The whole suite takes about 7 s.
+
+**Known limitations (not built)**
+
+- **Changes made in the Sonos app aren't pushed to the TV** (the "COULD" in 4.3). The TV's
+  number catches up the next time the bridge connects or a CEC key is pressed. Meanwhile
+  the next LG remote press sets the Sonos to the TV's number + 1.
+- **No re-discovery when the TV's IP address changes** (4.4, optional). The tab keeps
+  saying "Can't reach the TV". The README says to Find and Pair again, or give the TV a
+  fixed address in the router.
+- **Re-running the Wi-Fi setup in hotspot mode (`ap_mode.py`) rewrites `config.json`
+  without `lg_tv`**, so the TV must be paired again afterwards. `ap_mode.py` wasn't
+  touched, to keep the change small. Factory reset deletes it on purpose.
+- **Pressing volume on the TV in the second it takes to connect** is overridden by the
+  connect-time sync (the TV takes the Sonos's level).
+- **Not tried on a real LG TV.** Behaviour comes from aiowebostv and lgtv2 and is tested
+  against the fake TV only.
 
 ## Appendix: sources
 
