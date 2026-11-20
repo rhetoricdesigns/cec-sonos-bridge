@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-CEC-Sonos Bridge - TV Splash Screen
-Displays a splash screen on the TV with QR code to sonosbridge.local
+VolumeBridge - TV Splash Screen
+Displays a splash screen on the TV with a QR code to this device's admin address
 
 Uses framebuffer to display directly on HDMI output.
 """
 
 import os
+import socket
 import sys
 import subprocess
 import logging
@@ -15,7 +16,8 @@ log = logging.getLogger(__name__)
 
 APP_DIR = '/opt/cec-sonos-bridge'
 SPLASH_IMAGE = f'{APP_DIR}/splash.png'
-SPLASH_URL = 'http://sonosbridge.local'
+ADMIN_HOST = f'{socket.gethostname()}.local'  # volumebridge.local on new installs
+SPLASH_URL = f'http://{ADMIN_HOST}'
 
 
 def generate_splash_image():
@@ -67,10 +69,10 @@ def generate_splash_image():
     draw.polygon([(cx - 20, cy - 20), (cx - 20, cy + 20), (cx + 10, cy + 35), (cx + 10, cy - 35)], fill=bg_color)
     
     # Draw title
-    draw.text((width // 2, 280), "Sonos Bridge", font=font_large, fill=text_color, anchor="mm")
+    draw.text((width // 2, 280), "VolumeBridge", font=font_large, fill=text_color, anchor="mm")
     
     # Draw subtitle
-    draw.text((width // 2, 360), "Control your Sonos with your TV remote", font=font_medium, fill=(180, 180, 180), anchor="mm")
+    draw.text((width // 2, 360), "Control your Sonos speakers with your TV remote", font=font_medium, fill=(180, 180, 180), anchor="mm")
     
     # Draw status indicator
     draw.ellipse([width//2 - 10, 420, width//2 + 10, 440], fill=(40, 167, 69))  # Green dot
@@ -82,7 +84,7 @@ def generate_splash_image():
     img.paste(qr_img, (qr_x, qr_y))
     
     # Draw URL below QR
-    draw.text((width // 2, 840), "sonosbridge.local", font=font_medium, fill=accent_color, anchor="mm")
+    draw.text((width // 2, 840), ADMIN_HOST, font=font_medium, fill=accent_color, anchor="mm")
     
     # Draw instruction
     draw.text((width // 2, 920), "Scan QR code or visit the URL above", font=font_small, fill=(150, 150, 150), anchor="mm")
@@ -100,9 +102,9 @@ def generate_splash_image():
 
 def display_splash():
     """Display splash image on framebuffer."""
-    if not os.path.exists(SPLASH_IMAGE):
-        if not generate_splash_image():
-            return False
+    # Always regenerate, so name or address changes reach units that already have an old splash.png
+    if not generate_splash_image() and not os.path.exists(SPLASH_IMAGE):
+        return False
     
     # Try different methods to display the image
     

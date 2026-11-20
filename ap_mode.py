@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CEC-Sonos Bridge - Access Point Mode
+VolumeBridge - Access Point Mode
 Creates WiFi hotspot and serves setup wizard for:
   1. WiFi network selection
   2. Sonos speaker selection  
@@ -44,8 +44,8 @@ SCAN_CACHE_FILE = f'{APP_DIR}/wifi_scan.json'
 SONOS_CACHE_FILE = f'{APP_DIR}/sonos_scan.json'
 WIFI_CREDS_FILE = f'{APP_DIR}/wifi_creds_temp.json'
 
-HOTSPOT_SSID = "SonosBridge-Setup"
-HOTSPOT_PASSWORD = "sonosbridge"
+HOTSPOT_SSID = "VolumeBridge-Setup"
+HOTSPOT_PASSWORD = "volumebridge"
 HOTSPOT_IP = "192.168.4.1"
 HOTSPOT_CON_NAME = "SonosBridge-Hotspot"
 
@@ -59,7 +59,7 @@ SETUP_PAGE_HTML = """<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
     <meta name="apple-mobile-web-app-capable" content="yes">
-    <title>Sonos Bridge Setup</title>
+    <title>VolumeBridge Setup</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -137,8 +137,8 @@ SETUP_PAGE_HTML = """<!DOCTYPE html>
     <div class="container">
         <div class="card">
             <div class="logo">&#128266;</div>
-            <h1>Sonos Bridge Setup</h1>
-            <p class="subtitle">Control your Sonos with your TV remote<br><small style="opacity:0.6">http://sonosbridge.local</small></p>
+            <h1>VolumeBridge Setup</h1>
+            <p class="subtitle">Control your Sonos speakers with your TV remote<br><small style="opacity:0.6">http://__ADMIN_HOST__</small></p>
         </div>
 
         <div class="card" id="step1">
@@ -389,7 +389,7 @@ function testWifiAndLoadSpeakers() {
     
     var speakerList = document.getElementById("speakerList");
     var countdown = 60;
-    speakerList.innerHTML = "<div class='loading'><span class='spinner'></span>Scanning for Sonos speakers...<br><br><strong>Reconnect to SonosBridge-Setup in: <span id='countdown'>" + countdown + "</span> seconds</strong><br><br>The hotspot will disconnect while scanning.<br>Wait for the countdown, then reconnect and visit:<br><strong>http://sonosbridge.local</strong></div>";
+    speakerList.innerHTML = "<div class='loading'><span class='spinner'></span>Scanning for Sonos speakers...<br><br><strong>Reconnect to VolumeBridge-Setup in: <span id='countdown'>" + countdown + "</span> seconds</strong><br><br>The hotspot will disconnect while scanning.<br>Wait for the countdown, then reconnect and visit:<br><strong>http://__ADMIN_HOST__</strong></div>";
     
     document.getElementById("scanSonosBtn").disabled = true;
     document.getElementById("scanSonosBtn").textContent = "Scanning...";
@@ -403,7 +403,7 @@ function testWifiAndLoadSpeakers() {
         }
         if (countdown <= 0) {
             clearInterval(timer);
-            speakerList.innerHTML = "<div class='status info'><strong>Scan complete!</strong><br><br>1. Reconnect to <strong>SonosBridge-Setup</strong> WiFi<br>2. Refresh this page<br><br>Your Sonos speakers should appear.</div>";
+            speakerList.innerHTML = "<div class='status info'><strong>Scan complete!</strong><br><br>1. Reconnect to <strong>VolumeBridge-Setup</strong> WiFi<br>2. Refresh this page<br><br>Your Sonos speakers should appear.</div>";
             document.getElementById("scanSonosBtn").disabled = false;
             document.getElementById("scanSonosBtn").textContent = "Scan Again";
         }
@@ -679,7 +679,7 @@ def create_hotspot():
     run_cmd('systemctl restart avahi-daemon')
     
     log.info(f"Hotspot active: {HOTSPOT_SSID} (password: {HOTSPOT_PASSWORD})")
-    log.info(f"Access at: http://sonosbridge.local or http://{HOTSPOT_IP}")
+    log.info(f"Access at: http://{socket.gethostname()}.local or http://{HOTSPOT_IP}")
     return True
 
 
@@ -902,7 +902,7 @@ class SetupHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         
         if path == '/' or path == '/index.html':
-            self.send_html(SETUP_PAGE_HTML)
+            self.send_html(SETUP_PAGE_HTML.replace('__ADMIN_HOST__', socket.gethostname() + '.local'))
             return
         
         # iOS captive portal detection
@@ -1025,7 +1025,7 @@ def delayed_reboot():
 
 def main():
     log.info("=" * 50)
-    log.info("CEC-Sonos Bridge - AP Mode Starting")
+    log.info("VolumeBridge - AP Mode Starting")
     log.info("=" * 50)
     
     prescan_wifi_networks()

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-CEC-Sonos Bridge - Web Server v1.3.1
+VolumeBridge - Web Server v1.3.1
 Runs in both AP mode and Bridge mode:
   - AP Mode: Setup wizard for WiFi and Sonos configuration
   - Bridge Mode: Admin panel for updates, settings, and control
 
-Access at: http://sonosbridge.local
+Access at: http://<hostname>.local (volumebridge.local on new installs)
 
 v1.3.1: Fixed mobile browser compatibility
   - Replaced confirm() dialogs with inline confirmation buttons
@@ -276,7 +276,7 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
     <meta name="apple-mobile-web-app-capable" content="yes">
-    <title>Sonos Bridge Admin</title>
+    <title>VolumeBridge Admin</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -361,7 +361,7 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
     <div class="container">
         <div class="card">
             <div class="logo">&#128266;</div>
-            <h1>Sonos Bridge</h1>
+            <h1>VolumeBridge</h1>
             <p class="subtitle">Admin Panel</p>
         </div>
 
@@ -743,7 +743,7 @@ SETUP_PAGE_HTML = """<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
     <meta name="apple-mobile-web-app-capable" content="yes">
-    <title>Sonos Bridge Setup</title>
+    <title>VolumeBridge Setup</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -801,7 +801,7 @@ SETUP_PAGE_HTML = """<!DOCTYPE html>
     <div class="container">
         <div class="card">
             <div class="logo">&#128266;</div>
-            <h1>Sonos Bridge Setup</h1>
+            <h1>VolumeBridge Setup</h1>
             <p class="subtitle">Select your Sonos speaker</p>
         </div>
 
@@ -1113,7 +1113,7 @@ def run_server(port=WEB_PORT):
     """Run the web server."""
     server = HTTPServer(('0.0.0.0', port), WebHandler)
     log.info(f"Admin web server running on port {port}")
-    log.info(f"Access at: http://sonosbridge.local")
+    log.info(f"Access at: http://{__import__('socket').gethostname()}.local")
     server.serve_forever()
 
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-CEC-Sonos Bridge v1.5.1
+VolumeBridge v1.5.1 (HDMI-CEC to Sonos speaker volume)
 Monitors HDMI-CEC for TV remote volume commands and controls Sonos speaker.
-Also runs a web server for admin access at http://sonosbridge.local
+Also runs a web server for admin access at http://<hostname>.local
 
 Talks to the kernel's CEC device (/dev/cec0) directly, as a pure Audio System.
 Falls back to cec-client when /dev/cec0 is missing (legacy firmware CEC).
@@ -765,10 +765,10 @@ def run_bridge(config):
     hdmi_port = config.get('hdmi_port', '2')
 
     log.info("=" * 50)
-    log.info("CEC-Sonos Bridge v1.5.1 Active")
+    log.info("VolumeBridge v1.5.1 Active")
     log.info(f"Speaker: {speaker_name} ({speaker_ip})")
     log.info(f"HDMI Port: {hdmi_port}")
-    log.info(f"Admin: http://sonosbridge.local")
+    log.info(f"Admin: http://{__import__('socket').gethostname()}.local")
     log.info("=" * 50)
     log.info("")
     log.info("Volume commands: :44:41 (up) :44:42 (down) :44:43 (mute)")
@@ -849,7 +849,7 @@ def install_signal_handlers():
 
 def main():
     """Main entry point."""
-    log.info("CEC-Sonos Bridge v1.5.1 starting...")
+    log.info("VolumeBridge v1.5.1 starting...")
 
     config = load_config()
     if not config:

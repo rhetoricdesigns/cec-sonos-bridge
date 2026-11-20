@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CEC-Sonos Bridge - Startup Manager
+VolumeBridge - Startup Manager
 Decides which mode to run at boot:
   1. AP Mode - If no WiFi configured or can't connect
   2. Bridge Mode - If WiFi connected and Sonos configured
@@ -163,8 +163,8 @@ def start_ap_mode():
     """Start AP mode with setup wizard."""
     log.info("=" * 50)
     log.info("STARTING AP MODE")
-    log.info("Connect to WiFi: SonosBridge-Setup")
-    log.info("Password: sonosbridge")
+    log.info("Connect to WiFi: VolumeBridge-Setup")
+    log.info("Password: volumebridge")
     log.info("Then open: http://192.168.4.1")
     log.info("=" * 50)
     
@@ -172,7 +172,7 @@ def start_ap_mode():
 
 
 def start_bridge_mode():
-    """Start the CEC-Sonos bridge."""
+    """Start the bridge."""
     log.info("=" * 50)
     log.info("STARTING BRIDGE MODE")
     log.info("TV remote now controls Sonos!")
@@ -184,7 +184,7 @@ def start_bridge_mode():
 def main():
     """Main startup logic."""
     log.info("=" * 50)
-    log.info("CEC-Sonos Bridge - Startup")
+    log.info("VolumeBridge - Startup")
     log.info("=" * 50)
     
     # Ensure app directory exists

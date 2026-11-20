@@ -1,10 +1,9 @@
-# CEC-Sonos Bridge
+# VolumeBridge
 
-Control your Sonos speakers with your TV remote using a Raspberry Pi and HDMI-CEC.
+**by Rhetoric Designs** · Control your Sonos speakers with your TV remote over HDMI-CEC.
 
-![Version](https://img.shields.io/badge/version-1.2.0-blue)
+![Version](https://img.shields.io/badge/version-1.5.1-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Pi](https://img.shields.io/badge/Raspberry%20Pi-Zero%202%20W-red)
 
 ---
 
@@ -31,7 +30,7 @@ The Pi plugs into an HDMI port on your TV and pretends to be an "audio system." 
 
 - **Phone-friendly setup wizard** — No coding required
 - **Auto hotspot mode** — Creates WiFi network if it can't connect
-- **Admin panel** — Access at `sonosbridge.local`
+- **Admin panel** — Access at `volumebridge.local`
 - **TV splash screen** — Shows QR code to admin panel
 - **Auto-recovery** — Falls back to setup mode if WiFi is lost
 - **OTA updates** — Update from the admin panel
@@ -59,7 +58,7 @@ The Pi plugs into an HDMI port on your TV and pretends to be an "audio system." 
 1. Download [Raspberry Pi Imager](https://www.raspberrypi.com/software/)
 2. Select **Raspberry Pi OS Lite (64-bit)**
 3. Click the ⚙️ gear icon and configure:
-   - Hostname: `sonosbridge`
+   - Hostname: `volumebridge`
    - Enable SSH: **Yes**
    - Username: `pi`
    - Password: *(your choice)*
@@ -73,7 +72,7 @@ The Pi plugs into an HDMI port on your TV and pretends to be an "audio system." 
 3. Power on and wait 2-3 minutes
 4. SSH into the Pi:
    ```bash
-   ssh pi@sonosbridge.local
+   ssh pi@volumebridge.local
    ```
 5. Download and run the installer:
    ```bash
@@ -86,7 +85,7 @@ The Pi plugs into an HDMI port on your TV and pretends to be an "audio system." 
 
 ### Step 3: Configure
 
-1. Connect your phone to WiFi: **SonosBridge-Setup** (password: `sonosbridge`)
+1. Connect your phone to WiFi: **VolumeBridge-Setup** (password: `volumebridge`)
 2. Open your browser to `http://192.168.4.1`
 3. Select your home WiFi and enter the password
 4. Click "Scan for Sonos Speakers" 
@@ -100,7 +99,7 @@ The Pi plugs into an HDMI port on your TV and pretends to be an "audio system." 
 
 ## Admin Panel
 
-After setup, access the admin panel at: **http://sonosbridge.local**
+After setup, access the admin panel at: **http://volumebridge.local**
 
 Features:
 - Test volume control
@@ -116,7 +115,7 @@ Features:
 ### Can't find the Pi on my network
 ```bash
 # Try finding it by IP
-ping sonosbridge.local
+ping volumebridge.local
 
 # Or scan your network
 arp -a | grep raspberry
@@ -127,7 +126,7 @@ arp -a | grep raspberry
 2. Try a different HDMI port (avoid ARC/eARC ports)
 3. Check the logs:
    ```bash
-   ssh pi@sonosbridge.local
+   ssh pi@volumebridge.local
    sudo tail -f /var/log/cec-sonos-bridge.log
    ```
 
@@ -139,7 +138,7 @@ sudo reboot
 ```
 
 ### Factory reset
-From the admin panel at `sonosbridge.local`, go to Settings → Factory Reset
+From the admin panel at `volumebridge.local`, go to Settings → Factory Reset
 
 Or via SSH:
 ```bash
@@ -180,6 +179,10 @@ CEC Commands intercepted:
 
 ---
 
+> **Updating from an older version?** Units installed as "Sonos Bridge" keep their old address (`sonosbridge.local`); the TV screen always shows the right one. New installs use `volumebridge.local`.
+
+---
+
 ## License
 
 MIT License — feel free to use, modify, and share!
@@ -198,3 +201,7 @@ MIT License — feel free to use, modify, and share!
 Found a bug? Have an idea? Open an issue or submit a pull request!
 
 Run the tests (no Pi needed) with `python3 -m unittest discover tests`.
+
+---
+
+<sub>VolumeBridge is an independent product by Rhetoric Designs and is not affiliated with, endorsed or sponsored by Sonos, Inc., Raspberry Pi Ltd or HDMI Licensing Administrator, Inc. Sonos is a trademark of Sonos, Inc. Raspberry Pi is a trademark of Raspberry Pi Ltd. HDMI is a trademark of HDMI Licensing Administrator, Inc.</sub>

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# CEC-Sonos Bridge - Installer v1.2.0
+# VolumeBridge - Installer v1.2.0
 # ============================================================
 
 set -e
@@ -8,7 +8,7 @@ VERSION="1.2.0"
 
 echo ""
 echo "=================================================="
-echo "  CEC-Sonos Bridge Installer v${VERSION}"
+echo "  VolumeBridge Installer v${VERSION}"
 echo "=================================================="
 echo ""
 
@@ -36,7 +36,7 @@ chmod +x "$APP_DIR"/*.py
 echo "⚙️  [4/7] Creating system service..."
 cat > /etc/systemd/system/cec-sonos-bridge.service << 'SERVICE'
 [Unit]
-Description=CEC-Sonos Bridge
+Description=VolumeBridge
 After=network.target NetworkManager.service
 Wants=network.target
 
@@ -67,19 +67,19 @@ if ! grep -q "quiet" "$CMDLINE" 2>/dev/null; then
 fi
 
 if ! grep -q "disable_splash=1" "$CONFIG" 2>/dev/null; then
-    echo -e "\n# CEC-Sonos Bridge\ndisable_splash=1" >> "$CONFIG"
+    echo -e "\n# VolumeBridge\ndisable_splash=1" >> "$CONFIG"
 fi
 
 echo "🌐 [6/7] Configuring network..."
-hostnamectl set-hostname sonosbridge 2>/dev/null || echo "sonosbridge" > /etc/hostname
-grep -q "sonosbridge" /etc/hosts || echo "127.0.1.1 sonosbridge" >> /etc/hosts
+hostnamectl set-hostname volumebridge 2>/dev/null || echo "volumebridge" > /etc/hostname
+grep -q "volumebridge" /etc/hosts || echo "127.0.1.1 volumebridge" >> /etc/hosts
 
 mkdir -p /etc/avahi/services
 cat > /etc/avahi/services/sonos-bridge.service << 'AVAHI'
 <?xml version="1.0" standalone='no'?>
 <!DOCTYPE service-group SYSTEM "avahi-service.dtd">
 <service-group>
-  <n>Sonos Bridge</n>
+  <n>VolumeBridge</n>
   <service><type>_http._tcp</type><port>80</port></service>
 </service-group>
 AVAHI
@@ -97,13 +97,13 @@ echo "  ✓ Installation Complete!"
 echo "=================================================="
 echo ""
 echo "FIRST BOOT:"
-echo "  1. Pi creates hotspot: SonosBridge-Setup"
-echo "  2. Connect phone to hotspot (password: sonosbridge)"
-echo "  3. Open http://sonosbridge.local"
+echo "  1. Bridge creates hotspot: VolumeBridge-Setup"
+echo "  2. Connect phone to hotspot (password: volumebridge)"
+echo "  3. Open http://volumebridge.local"
 echo "  4. Select WiFi and Sonos speaker"
 echo "  5. Done! TV remote controls Sonos"
 echo ""
-echo "ADMIN PANEL: http://sonosbridge.local"
+echo "ADMIN PANEL: http://volumebridge.local"
 echo "  - Test volume, update, rollback, logs"
 echo ""
 echo "DEBUG: Create /boot/firmware/FORCE_AP_MODE to reset"
